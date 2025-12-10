@@ -2,9 +2,58 @@
 
 ## How It Works
 
-**The Reality:** I (Claude) can't monitor files in the background or check them automatically every 10 minutes. I only "wake up" when you send me a message.
+**The Reality:** I (Claude) can't monitor files in the background 24/7 like a daemon process. I only "wake up" when you send me a message.
 
-**The Solution:** A shared notes file that you can edit anytime, and I'll read when you ask.
+**The Solution:** A shared notes file that you can edit anytime, and I'll check automatically while I'm working:
+
+- **At the start of any work session** - I check if notes should be read
+- **Between planning steps** - I periodically check if 10+ minutes have passed
+- **When file is modified** - The system detects changes and prompts me to read
+- **On your request** - You can always say "check notes" for immediate reading
+
+---
+
+## Automatic Checking System
+
+### How Automatic Checking Works
+
+The system uses two files to track when notes should be read:
+
+1. **`.notes_tracker`** - Stores timestamps of last check and last modification
+2. **`check-notes-auto.sh`** - Script that determines if notes should be read
+
+**When I Check Notes Automatically:**
+
+- ✅ **Every 10+ minutes** while actively working on tasks
+- ✅ **When you modify the notes file** - System detects changes
+- ✅ **At the beginning** of any work session
+- ✅ **Between major tasks** or planning phases
+- ✅ **When you request** - Just say "check notes"
+
+**The Check Logic:**
+
+```bash
+# I should read notes if EITHER:
+# 1. 10+ minutes have passed since last check
+# 2. Notes file was modified since last check
+```
+
+**Behind the Scenes:**
+
+When I'm working on tasks, I'll periodically run:
+```bash
+bash ~/Desktop/Jarvis-Voice-Assistant/check-notes-auto.sh
+```
+
+If the script says `SHOULD_READ=yes`, I'll:
+1. Read your notes from `DANIEL_NOTES.md`
+2. Incorporate your thoughts into my current context
+3. Update the tracker with the current timestamp
+4. Continue working with your context in mind
+
+**What This Means for You:**
+
+You can edit the notes file anytime, and I'll pick up your thoughts during my natural workflow pauses. No need to explicitly tell me every time - just update the notes and I'll see them within 10 minutes (or sooner if I'm between tasks).
 
 ---
 
