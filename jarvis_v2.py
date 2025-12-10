@@ -50,7 +50,7 @@ class JarvisV2:
         self.sample_rate = 16000
         self.wake_duration = 1.5
         self.command_duration = 15
-        self.wake_threshold = 0.005
+        self.wake_threshold = 0.0005  # Super sensitive - picks up whispers
 
         # Conversation history
         self.conversation_history = []
