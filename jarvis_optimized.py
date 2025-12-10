@@ -36,9 +36,9 @@ class JarvisAssistant:
         self.sample_rate = 16000
 
         # Simple wake word detection settings
-        self.wake_threshold = 0.03  # Audio energy threshold
-        self.wake_duration = 1.5    # Seconds to record for wake word check
-        self.command_duration = 15  # Extended to 15 seconds
+        self.wake_threshold = 0.005  # Audio energy threshold (lower = more sensitive)
+        self.wake_duration = 1.5     # Seconds to record for wake word check
+        self.command_duration = 15   # Extended to 15 seconds
 
         # System prompt to make responses less restrictive
         self.system_prompt = """You are JARVIS, a helpful AI assistant. Be direct, honest, and conversational.

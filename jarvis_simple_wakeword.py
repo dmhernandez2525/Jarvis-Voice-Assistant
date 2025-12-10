@@ -30,8 +30,8 @@ class JarvisAssistant:
         self.sample_rate = 16000
 
         # Simple wake word detection settings
-        self.wake_threshold = 0.03  # Audio energy threshold
-        self.wake_duration = 1.5    # Seconds to record for wake word check
+        self.wake_threshold = 0.005  # Audio energy threshold (lower = more sensitive)
+        self.wake_duration = 1.5     # Seconds to record for wake word check
 
         print("\n" + "="*60)
         print("JARVIS is ready!")
