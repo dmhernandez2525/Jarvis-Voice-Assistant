@@ -39,7 +39,7 @@ class JarvisUncensored:
         self.sample_rate = 16000
         self.wake_duration = 1.5  # seconds to listen for wake word
         self.command_duration = 15  # seconds to record command
-        self.wake_threshold = 0.02  # energy threshold for wake word
+        self.wake_threshold = 0.005  # energy threshold for wake word (lower = more sensitive)
 
         print("\n" + "="*60)
         print("Uncensored JARVIS is ready!")
