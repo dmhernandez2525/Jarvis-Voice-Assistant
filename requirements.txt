@@ -1,0 +1,33 @@
+# JARVIS Voice Assistant - Python Dependencies
+# Install all: pip3 install -r requirements.txt
+
+# IMPORTANT: First install system dependencies:
+# brew install portaudio ffmpeg
+
+# Speech Recognition
+openai-whisper
+
+# Audio Processing
+pyaudio
+sounddevice
+scipy
+numpy
+
+# LLM Integration
+ollama
+
+# Wake Word Detection
+pvporcupine
+
+# Web Server (for remote devices)
+flask
+
+# Text-to-Speech
+pyttsx3
+
+# Home Assistant Integration
+requests
+paho-mqtt
+
+# Optional: Async support
+requests-async
