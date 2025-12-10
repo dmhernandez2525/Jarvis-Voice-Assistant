@@ -76,13 +76,62 @@ class JarvisV2:
         # Conversation history
         self.conversation_history = []
 
+    def calibrate_microphone(self):
+        """Test microphone and show audio levels"""
+        print("🎤 Microphone Calibration")
+        print("   Say 'Jarvis' at normal volume in 3 seconds...")
+        print("   ", end="", flush=True)
+
+        time.sleep(1)
+        print("3...", end="", flush=True)
+        time.sleep(1)
+        print("2...", end="", flush=True)
+        time.sleep(1)
+        print("1...", end="", flush=True)
+
+        # Record 2 seconds
+        audio = sd.rec(
+            int(2 * self.sample_rate),
+            samplerate=self.sample_rate,
+            channels=1,
+            dtype='float32'
+        )
+        sd.wait()
+
+        # Calculate energy
+        energy = np.abs(audio).mean()
+
+        print(f"\n\n   📊 Your audio level: {energy:.6f}")
+        print(f"   🎚️  Current threshold: {self.wake_threshold:.6f}")
+
+        if energy > self.wake_threshold:
+            print(f"   ✅ GOOD - You're loud enough! (Detected!)")
+        else:
+            ratio = self.wake_threshold / energy if energy > 0 else 999
+            print(f"   ❌ TOO QUIET - You need to be {ratio:.1f}x louder")
+            print(f"   💡 Try: Speak closer to mic, or increase volume")
+
+            # Offer to auto-adjust
+            print(f"\n   Adjusting threshold to {energy * 0.7:.6f} (70% of your voice)")
+            self.wake_threshold = max(0.0001, energy * 0.7)  # 70% of detected level
+
+        print()
+
         print("\n" + "="*60)
         print("JARVIS V2 is ready!")
+        print("="*60)
         print("✅ Conversation history enabled")
         print("✅ Visual countdown")
         print("✅ No warnings")
         print("✅ Truly uncensored")
+        print(f"\n🎚️  Audio Settings:")
+        print(f"   Wake word threshold: {self.wake_threshold} (lower = more sensitive)")
+        print(f"   You need to speak at energy > {self.wake_threshold}")
+        print(f"\n💡 Tip: If not detecting, try speaking closer to mic")
         print("="*60 + "\n")
+
+        # Run quick calibration
+        self.calibrate_microphone()
 
     def listen_for_wakeword(self):
         """Listen for wake word 'Jarvis'"""
@@ -96,8 +145,15 @@ class JarvisV2:
             )
             sd.wait()
 
+            # Calculate energy
+            energy = np.abs(audio).mean()
+
+            # Show energy level every few iterations (debugging)
+            # Uncomment to see real-time levels:
+            # print(f"🎚️ {energy:.6f} ", end="\r", flush=True)
+
             # Check if there's sound
-            if np.abs(audio).mean() > self.wake_threshold:
+            if energy > self.wake_threshold:
                 # Save to temp file
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                     temp_path = f.name
