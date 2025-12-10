@@ -38,12 +38,33 @@ class JarvisV2:
         print("Initializing text-to-speech...")
         start = time.time()
         self.tts_engine = pyttsx3.init()
-        self.tts_engine.setProperty('rate', 175)
-        # Get available voices
+
+        # Set faster, more natural speech rate
+        self.tts_engine.setProperty('rate', 220)  # Faster (was 175)
+
+        # Get available voices and pick a friendlier one
         voices = self.tts_engine.getProperty('voices')
         if voices:
-            # Use first available voice
-            self.tts_engine.setProperty('voice', voices[0].id)
+            # Try to find Samantha (friendly female voice on macOS)
+            # or any voice with "female" or "premium" in the name
+            friendly_voice = None
+            for voice in voices:
+                voice_name = voice.name.lower()
+                if 'samantha' in voice_name or 'karen' in voice_name:
+                    friendly_voice = voice
+                    break
+                elif 'female' in voice_name or 'premium' in voice_name:
+                    friendly_voice = voice
+
+            # Use friendly voice if found, otherwise use last voice (usually better than first)
+            if friendly_voice:
+                self.tts_engine.setProperty('voice', friendly_voice.id)
+                print(f"  🎙  Using voice: {friendly_voice.name}")
+            else:
+                # Use last voice (often better quality on macOS)
+                self.tts_engine.setProperty('voice', voices[-1].id)
+                print(f"  🎙  Using voice: {voices[-1].name}")
+
         print(f"  ⏱  Initialized in {int((time.time() - start) * 1000)}ms")
 
         # Audio settings
