@@ -23,7 +23,7 @@
 
 ## Ideas / Future Plans
 
-[Ideas for JARVIS or other projects]
+- JARVIS speaking in different voices - Could be useful for different contexts or personas
 
 ---
 
