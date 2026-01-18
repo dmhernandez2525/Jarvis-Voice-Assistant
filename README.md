@@ -1,6 +1,9 @@
-# Voice Assistant - Maximum Intelligence Edition
+# Jarvis Voice Assistant
 
-A powerful voice assistant using:
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+
+A powerful, fully offline voice assistant using:
 - **Whisper Large** - State-of-the-art speech recognition
 - **Qwen 2.5:72b** - Maximum intelligence LLM (671B parameters)
 - **pyttsx3** - Text-to-speech
