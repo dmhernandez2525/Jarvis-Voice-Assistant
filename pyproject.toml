@@ -1,0 +1,99 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jarvis-voice-assistant"
+version = "0.1.0"
+description = "A powerful, fully offline voice assistant using Whisper, Ollama, and pyttsx3"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Daniel Hernandez"}
+]
+requires-python = ">=3.11"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+keywords = ["voice-assistant", "speech-recognition", "whisper", "ollama", "tts"]
+
+dependencies = [
+    "openai-whisper",
+    "pyaudio",
+    "sounddevice",
+    "scipy",
+    "numpy",
+    "ollama",
+    "pyttsx3",
+    "flask",
+    "requests",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=4.0",
+    "pytest-mock>=3.12",
+    "black>=24.0",
+    "flake8>=7.0",
+    "mypy>=1.8",
+]
+wake-word = [
+    "pvporcupine",
+]
+home-assistant = [
+    "paho-mqtt",
+]
+
+[project.urls]
+Homepage = "https://github.com/dmhernandez2525/jarvis-voice-assistant"
+Repository = "https://github.com/dmhernandez2525/jarvis-voice-assistant.git"
+Issues = "https://github.com/dmhernandez2525/jarvis-voice-assistant/issues"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "requires_audio: marks tests that require audio hardware",
+]
+
+[tool.coverage.run]
+source = ["."]
+omit = [
+    "tests/*",
+    "venv/*",
+    ".venv/*",
+    "*/__pycache__/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]
+fail_under = 70
+
+[tool.black]
+line-length = 88
+target-version = ["py311"]
+include = '\.pyi?$'
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
