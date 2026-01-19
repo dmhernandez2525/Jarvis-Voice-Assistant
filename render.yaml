@@ -1,0 +1,58 @@
+# Jarvis Voice Assistant - Render Infrastructure Configuration
+# ============================================================
+# Flask API server for remote voice assistant access.
+#
+# IMPORTANT NOTES:
+# - This deploys the server mode only (voice_assistant_server.py)
+# - Requires external Ollama instance for LLM inference
+# - Whisper runs on the server (CPU-intensive, may be slow on free tier)
+#
+# LIMITATIONS (as of January 2026):
+# - Free web services spin down after 15 minutes of inactivity
+# - No GPU support on Render (Whisper will use CPU)
+# - 512MB RAM limit on free tier (may not fit large Whisper models)
+#
+# RECOMMENDATION: Deploy on a machine with GPU for production use.
+# This config is for demo/testing purposes.
+#
+# Cost: $0/month (free tier) or $7/month (starter for better performance)
+
+services:
+  # =============================================
+  # API Server - Flask Voice Assistant
+  # =============================================
+  - type: web
+    name: jarvis-voice-api
+    runtime: python
+    plan: free  # Change to 'starter' for production
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+    startCommand: python voice_assistant_server.py
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"
+      - key: PORT
+        value: "5000"
+      # Ollama configuration (external instance required)
+      - key: OLLAMA_HOST
+        value: UPDATE_ME  # e.g., http://your-ollama-server:11434
+      - key: OLLAMA_MODEL
+        value: "qwen2.5:7b"  # Use smaller model for limited resources
+      # Whisper configuration
+      - key: WHISPER_MODEL
+        value: "base"  # Use 'base' or 'small' for free tier RAM limits
+      # CORS configuration
+      - key: CORS_ORIGINS
+        value: "*"
+      # Optional: API authentication
+      - key: API_KEY
+        generateValue: true
+
+# NOTE: This service requires an external Ollama instance.
+# Ollama cannot run on Render due to model size and GPU requirements.
+# Options:
+# 1. Run Ollama on your own server/VM with GPU
+# 2. Use a cloud GPU provider (RunPod, Lambda Labs, etc.)
+# 3. Use OpenAI API instead (modify code to use openai package)
