@@ -43,7 +43,8 @@ services:
         destination: /index.html
 
   # =============================================
-  # API Server - Flask Voice Assistant
+  # API Server - Flask Voice Assistant (Stub)
+  # NOTE: Full voice processing requires Docker deployment with ffmpeg/portaudio
   # =============================================
   - type: web
     name: jarvis-voice-api
@@ -51,8 +52,8 @@ services:
     plan: free  # Change to 'starter' for production
     buildCommand: |
       pip install --upgrade pip
-      pip install -r requirements.txt
-    startCommand: python voice_assistant_server.py
+      pip install -r requirements-render.txt
+    startCommand: python voice_assistant_server_render.py
     healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION

@@ -1,0 +1,4 @@
+# Minimal requirements for Render deployment (health check only)
+# Full voice processing requires Docker with system dependencies
+flask>=2.0
+gunicorn>=21.0
