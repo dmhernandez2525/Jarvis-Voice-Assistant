@@ -1,10 +1,10 @@
 # Jarvis Voice Assistant - Render Infrastructure Configuration
 # ============================================================
-# Flask API server for remote voice assistant access.
+# Static landing page + Flask API server for remote voice assistant access.
 #
 # IMPORTANT NOTES:
-# - This deploys the server mode only (voice_assistant_server.py)
-# - Requires external Ollama instance for LLM inference
+# - Website: Static landing page explaining the project
+# - API Server: Deploys voice_assistant_server.py (requires external Ollama)
 # - Whisper runs on the server (CPU-intensive, may be slow on free tier)
 #
 # LIMITATIONS (as of January 2026):
@@ -12,12 +12,36 @@
 # - No GPU support on Render (Whisper will use CPU)
 # - 512MB RAM limit on free tier (may not fit large Whisper models)
 #
-# RECOMMENDATION: Deploy on a machine with GPU for production use.
+# RECOMMENDATION: Deploy API on a machine with GPU for production use.
 # This config is for demo/testing purposes.
-#
-# Cost: $0/month (free tier) or $7/month (starter for better performance)
 
 services:
+  # =============================================
+  # Static Site - Landing Page
+  # =============================================
+  - type: web
+    name: jarvis-website
+    env: static
+    buildCommand: cd website && npm install && npm run build
+    staticPublishPath: ./website/dist
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+    headers:
+      - path: /*
+        name: X-Frame-Options
+        value: DENY
+      - path: /*
+        name: X-Content-Type-Options
+        value: nosniff
+      - path: /*
+        name: Referrer-Policy
+        value: strict-origin-when-cross-origin
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+
   # =============================================
   # API Server - Flask Voice Assistant
   # =============================================
@@ -50,7 +74,7 @@ services:
       - key: API_KEY
         generateValue: true
 
-# NOTE: This service requires an external Ollama instance.
+# NOTE: The API service requires an external Ollama instance.
 # Ollama cannot run on Render due to model size and GPU requirements.
 # Options:
 # 1. Run Ollama on your own server/VM with GPU

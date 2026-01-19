@@ -53,3 +53,7 @@ recordings/
 *.pem
 *.key
 .env.local
+
+# Website
+website/node_modules/
+website/dist/
