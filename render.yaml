@@ -22,7 +22,7 @@ services:
   - type: web
     name: jarvis-website
     env: static
-    buildCommand: cd website && npm install && npm run build
+    buildCommand: cd website && npm ci && npm run build
     staticPublishPath: ./website/dist
     envVars:
       - key: NODE_VERSION
