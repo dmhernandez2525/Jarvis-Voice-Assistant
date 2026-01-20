@@ -21,7 +21,7 @@ services:
   # =============================================
   - type: web
     name: jarvis-site
-    env: static
+    runtime: static
     buildCommand: cd website && npm ci && npm run build
     staticPublishPath: ./website/dist
     envVars:
