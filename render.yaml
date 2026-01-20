@@ -20,7 +20,7 @@ services:
   # Static Site - Landing Page
   # =============================================
   - type: web
-    name: jarvis-website
+    name: jarvis-site
     env: static
     buildCommand: cd website && npm ci && npm run build
     staticPublishPath: ./website/dist
