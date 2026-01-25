@@ -181,6 +181,28 @@ For always-on devices, add wake word detection before sending to server:
 4. **Smart home integration** (HomeKit, Home Assistant)
 5. **Multiple language support**
 
+### Coming Soon: Full Duplex Conversation (PersonaPlex Integration)
+
+We're planning to integrate NVIDIA's **PersonaPlex** - an open-source full duplex conversational AI model that will revolutionize how Jarvis interacts:
+
+| Feature | Current | With PersonaPlex |
+|---------|---------|------------------|
+| Conversation Style | Turn-based (you speak, then Jarvis) | **Simultaneous** (natural overlap) |
+| Response Latency | 2-5 seconds | **<500ms** |
+| Active Listening | None | **Back-channeling** ("uh-huh", "right", "okay") |
+| Interruption | Must wait for response | **Natural mid-sentence interruption** |
+
+**What is Full Duplex?**
+Unlike traditional voice assistants that have strict user→agent→user turns, PersonaPlex listens and speaks simultaneously - just like a real human conversation. It can acknowledge what you're saying while you speak, and you can interrupt it naturally.
+
+**Technical Details:**
+- 7B parameter model based on Moshi architecture
+- Uses MIMI neural audio codec
+- Runs locally on 24GB+ VRAM (Mac M2 Max compatible)
+- Open source under Apache 2.0 license
+
+See `roadmap/PHASE_5_PERSONAPLEX.md` for implementation details.
+
 ## Troubleshooting
 
 - **"No module named 'pyaudio'"**: Install portaudio first: `brew install portaudio`

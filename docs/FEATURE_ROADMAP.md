@@ -358,6 +358,113 @@ weather:
 | Phase 2 | v2.5 | Q3 2025 | 2 months |
 | Phase 3 | v3.0 | Q4 2025 | 3 months |
 | Phase 4 | v4.0 | Q1 2026 | 3 months |
+| **Phase 5** | **v5.0** | **Q2 2026** | **2 months** |
+
+---
+
+## Phase 5: Full Duplex Conversation - PersonaPlex Integration (v5.0)
+
+**Goal:** Natural, human-like conversation with simultaneous listening/speaking
+
+### 5.1 PersonaPlex Core Integration
+
+NVIDIA's PersonaPlex is an open-source full duplex conversational AI that fundamentally changes voice interaction:
+
+| Feature | Current Jarvis | With PersonaPlex |
+|---------|----------------|------------------|
+| Conversation Model | Turn-based | **Full duplex** (simultaneous) |
+| Response Latency | 2-5 seconds | **<500ms** |
+| Active Listening | None | **Back-channeling** ("uh-huh", "okay") |
+| Interruption Handling | Must wait | **Natural mid-sentence** |
+| Wake Word → Response | ~3-8 seconds total | **<1 second** |
+
+### 5.2 Technical Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    PERSONAPLEX MODE                          │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│   ┌──────────────┐        ┌──────────────────────┐         │
+│   │   User       │◄──────►│     PersonaPlex      │         │
+│   │   Audio      │  Full  │   (7B Moshi Model)   │         │
+│   │   Stream     │ Duplex │   Port 8998          │         │
+│   └──────────────┘        └──────────────────────┘         │
+│                                    │                        │
+│                                    │ Complex queries        │
+│                                    ▼                        │
+│                           ┌──────────────────────┐         │
+│                           │   Ollama (Qwen 72B)  │         │
+│                           │   Deep reasoning     │         │
+│                           └──────────────────────┘         │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 5.3 Feature Checklist
+
+- [ ] PersonaPlex server deployment on Mac M2 Max
+- [ ] Mochi server running on port 8998
+- [ ] Audio stream integration (bi-directional)
+- [ ] Back-channeling responses during user speech
+- [ ] Natural interruption handling
+- [ ] Hybrid routing: PersonaPlex for conversation, Ollama for complex reasoning
+- [ ] Home Assistant command routing through PersonaPlex
+- [ ] Role-play personas (customer service, assistant, etc.)
+- [ ] Latency benchmarking (<500ms target)
+- [ ] Fallback to traditional mode if PersonaPlex unavailable
+
+### 5.4 Implementation Milestones
+
+| Milestone | Description | Duration |
+|-----------|-------------|----------|
+| M1 | PersonaPlex server setup & testing | 1 week |
+| M2 | Audio stream integration | 1 week |
+| M3 | Hybrid routing (PersonaPlex + Ollama) | 1 week |
+| M4 | Home Assistant integration | 1 week |
+| M5 | Multi-room PersonaPlex support | 2 weeks |
+| M6 | Performance optimization & testing | 1 week |
+
+### 5.5 Hardware Requirements
+
+| Component | Minimum | Recommended |
+|-----------|---------|-------------|
+| VRAM | 24GB | 32GB+ |
+| RAM | 32GB | 64GB+ |
+| Storage | 50GB | 100GB |
+| GPU | Apple M2 Pro | Apple M2 Max/Ultra |
+
+**Note:** Mac M2 Max with 96GB unified memory exceeds all requirements.
+
+### 5.6 Use Cases
+
+**Conversational Assistant:**
+```
+User: "Hey Jarvis, I'm thinking about..."
+PersonaPlex: "Uh-huh..." [back-channel while user continues]
+User: "...maybe going to the store later"
+PersonaPlex: "Sure, what do you need to pick up?"
+User: "Actually wait, first can you—"
+PersonaPlex: [stops immediately, listens]
+User: "—turn on the kitchen lights"
+PersonaPlex: "Done. Now, about that store trip?"
+```
+
+**Home Assistant Integration:**
+```
+User: "It's getting dark in here and also kind of warm"
+PersonaPlex: "I'll dim the lights and lower the thermostat. How's 72 degrees?"
+User: "Actually make it 70"
+PersonaPlex: "Got it, 70 degrees. Anything else?"
+```
+
+### 5.7 Success Metrics
+
+- [ ] Response latency <500ms for 90% of interactions
+- [ ] Back-channeling sounds natural (user survey)
+- [ ] Interruption detection accuracy >95%
+- [ ] Hybrid routing selects correct model 90%+ of time
+- [ ] User preference for PersonaPlex mode over traditional (A/B test)
 
 ---
 
