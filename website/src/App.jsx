@@ -11,6 +11,7 @@ function App() {
             <a href="#modes">Modes</a>
             <a href="#api">API</a>
             <a href="#hardware">Hardware</a>
+            <a href="#coming-soon" className="coming-soon-link">Coming Soon</a>
             <a href="https://github.com/dmhernandez2525/Jarvis-Voice-Assistant" target="_blank" rel="noopener noreferrer" className="github-link">GitHub</a>
           </div>
         </nav>
@@ -252,6 +253,64 @@ with open('recording.wav', 'rb') as f:
             </table>
           </div>
         </div>
+      </section>
+
+      <section id="coming-soon" className="coming-soon">
+        <h2>Coming Soon: Full Duplex Conversation</h2>
+        <div className="coming-soon-badge">PersonaPlex Integration</div>
+        <p className="section-description">
+          We're integrating NVIDIA's PersonaPlex - an open-source full duplex AI that will revolutionize how you interact with Jarvis.
+        </p>
+        <div className="coming-soon-grid">
+          <div className="coming-soon-card">
+            <div className="comparison">
+              <div className="comparison-item current">
+                <h4>Current</h4>
+                <p>Turn-based conversation</p>
+                <p className="metric">2-5 second latency</p>
+              </div>
+              <div className="comparison-arrow">→</div>
+              <div className="comparison-item future">
+                <h4>With PersonaPlex</h4>
+                <p>Simultaneous listening & speaking</p>
+                <p className="metric">&lt;500ms latency</p>
+              </div>
+            </div>
+          </div>
+          <div className="coming-soon-features">
+            <div className="csf-item">
+              <span className="csf-icon">🔄</span>
+              <div>
+                <h4>Full Duplex</h4>
+                <p>Listens and speaks at the same time, just like a real conversation</p>
+              </div>
+            </div>
+            <div className="csf-item">
+              <span className="csf-icon">💬</span>
+              <div>
+                <h4>Active Listening</h4>
+                <p>Says "uh-huh", "right", "okay" while you speak - feels natural</p>
+              </div>
+            </div>
+            <div className="csf-item">
+              <span className="csf-icon">✋</span>
+              <div>
+                <h4>Natural Interruption</h4>
+                <p>Interrupt mid-sentence naturally, no need to wait</p>
+              </div>
+            </div>
+            <div className="csf-item">
+              <span className="csf-icon">⚡</span>
+              <div>
+                <h4>Near-Zero Latency</h4>
+                <p>Responses feel instant, like talking to another person</p>
+              </div>
+            </div>
+          </div>
+        </div>
+        <p className="coming-soon-note">
+          <strong>Technical Details:</strong> 7B parameter model based on Moshi architecture, runs locally on 24GB+ VRAM (Mac M2 Max compatible), open source under Apache 2.0 license.
+        </p>
       </section>
 
       <section className="installation">
