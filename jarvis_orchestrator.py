@@ -36,6 +36,7 @@ import httpx
 # Import local modules
 from personaplex_client import PersonaPlexClient
 from voiceforge_tts import VoiceForgeTTS
+from homeassistant_client import HomeAssistantClient
 
 # Setup logging
 logging.basicConfig(
@@ -45,7 +46,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app)
+
+# Security: Limit request size to 50MB for audio uploads
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50 MB
+
+# Security: Configure CORS for local development only
+# In production, specify allowed origins
+ALLOWED_ORIGINS = os.environ.get("CORS_ORIGINS", "http://localhost:*,http://127.0.0.1:*")
+CORS(app, origins=ALLOWED_ORIGINS.split(",") if ALLOWED_ORIGINS != "*" else "*")
 
 # Load configuration
 CONFIG_PATH = Path(__file__).parent / "config" / "jarvis.yaml"
@@ -57,9 +65,15 @@ current_mode = config['defaults']['mode']
 whisper_model = None
 personaplex_client = None
 voiceforge_client = None
+homeassistant_client = None
 
 # Model configuration
 MODELS = config['models']
+
+# Home Assistant configuration
+HA_CONFIG = config.get('home_assistant', {})
+HA_ENABLED = HA_CONFIG.get('enabled', False)
+HA_TRIGGER_KEYWORDS = HA_CONFIG.get('trigger_keywords', [])
 
 
 def load_whisper():
@@ -97,6 +111,33 @@ def get_voiceforge_client():
             port=vf_config['port']
         )
     return voiceforge_client
+
+
+def get_homeassistant_client():
+    """Get or create Home Assistant client"""
+    global homeassistant_client
+    if homeassistant_client is None and HA_ENABLED:
+        ha_url = HA_CONFIG.get('url')
+        ha_token = HA_CONFIG.get('token')
+        ha_timeout = HA_CONFIG.get('timeout', 10.0)
+        homeassistant_client = HomeAssistantClient(
+            url=ha_url,
+            token=ha_token,
+            timeout=ha_timeout
+        )
+    return homeassistant_client
+
+
+def is_smart_home_command(text: str) -> bool:
+    """Check if text is a smart home command based on keywords"""
+    if not HA_ENABLED:
+        return False
+
+    text_lower = text.lower()
+    for keyword in HA_TRIGGER_KEYWORDS:
+        if keyword in text_lower:
+            return True
+    return False
 
 
 def analyze_query_complexity(text: str) -> str:
@@ -220,12 +261,23 @@ def health():
 
     ollama_url = f"http://{config['servers']['ollama']['host']}:{config['servers']['ollama']['port']}/api/tags"
     voiceforge_url = f"http://{config['servers']['voiceforge']['host']}:{config['servers']['voiceforge']['port']}/health"
-    personaplex_url = f"http://{config['servers']['personaplex']['host']}:{config['servers']['personaplex']['port']}/health"
+    # PersonaPlex doesn't have a /health endpoint, check root URL instead
+    personaplex_url = f"http://{config['servers']['personaplex']['host']}:{config['servers']['personaplex']['port']}/"
 
+    homeassistant_ok = False
     try:
         ollama_ok = loop.run_until_complete(check_service_health(ollama_url))
         voiceforge_ok = loop.run_until_complete(check_service_health(voiceforge_url))
         personaplex_ok = loop.run_until_complete(check_service_health(personaplex_url))
+
+        # Check Home Assistant if enabled
+        if HA_ENABLED:
+            try:
+                ha_client = get_homeassistant_client()
+                if ha_client and ha_client.is_configured:
+                    homeassistant_ok = loop.run_until_complete(ha_client.check_health())
+            except Exception:
+                pass
     finally:
         loop.close()
 
@@ -236,6 +288,8 @@ def health():
         "ollama_connected": ollama_ok,
         "voiceforge_connected": voiceforge_ok,
         "personaplex_connected": personaplex_ok,
+        "homeassistant_enabled": HA_ENABLED,
+        "homeassistant_connected": homeassistant_ok,
     })
 
 
@@ -281,6 +335,14 @@ def mode():
     })
 
 
+def validate_wav_header(data: bytes) -> bool:
+    """Validate that data starts with a WAV file header."""
+    if len(data) < 12:
+        return False
+    # WAV files start with "RIFF" and contain "WAVE"
+    return data[:4] == b'RIFF' and data[8:12] == b'WAVE'
+
+
 @app.route('/query', methods=['POST'])
 def query():
     """
@@ -300,8 +362,18 @@ def query():
     else:
         audio_data = request.files['audio'].read()
 
+    # Security: Validate audio data
+    if not audio_data:
+        return jsonify({"error": "Empty audio data"}), 400
+
+    if len(audio_data) < 44:  # Minimum WAV header size
+        return jsonify({"error": "Audio data too small"}), 400
+
+    if not validate_wav_header(audio_data):
+        return jsonify({"error": "Invalid audio format - expected WAV"}), 400
+
     # Save temporarily for Whisper
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False, mode='wb') as f:
         temp_path = f.name
         f.write(audio_data)
 
@@ -376,6 +448,34 @@ def text_query():
 
     total_start = time.time()
 
+    # Check for smart home commands first
+    if is_smart_home_command(text):
+        logger.info("Detected smart home command, routing to Home Assistant")
+        try:
+            client = get_homeassistant_client()
+            if client and client.is_configured:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    result = loop.run_until_complete(client.process_command(text))
+                finally:
+                    loop.close()
+
+                if result.get('is_smart_home', False):
+                    total_time = time.time() - total_start
+                    return jsonify({
+                        "transcription": text,
+                        "response": result.get('message', 'Smart home command processed'),
+                        "processing_time": total_time,
+                        "routed_to": "home_assistant",
+                        "smart_home": result,
+                        "timings": {
+                            "total_ms": int(total_time * 1000)
+                        }
+                    })
+        except Exception as e:
+            logger.warning(f"Home Assistant failed, continuing with normal routing: {e}")
+
     # Analyze and route
     complexity = analyze_query_complexity(text)
     backend = route_query(text, complexity)
@@ -410,6 +510,140 @@ def text_query():
             "total_ms": int(total_time * 1000)
         }
     })
+
+
+@app.route('/smart_home', methods=['POST'])
+def smart_home():
+    """
+    Process smart home command via Home Assistant.
+    Expects: JSON with 'command' field
+    Returns: JSON with success status and message
+    """
+    if not HA_ENABLED:
+        return jsonify({"error": "Home Assistant integration is not enabled"}), 400
+
+    data = request.get_json()
+    if not data or 'command' not in data:
+        return jsonify({"error": "No command provided"}), 400
+
+    command = data['command']
+    logger.info(f"Smart home command: {command}")
+
+    try:
+        client = get_homeassistant_client()
+        if not client:
+            return jsonify({"error": "Home Assistant client not configured"}), 500
+
+        if not client.is_configured:
+            return jsonify({"error": "Home Assistant token not configured. Set HA_TOKEN environment variable."}), 401
+
+        # Process the command
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(client.process_command(command))
+        finally:
+            loop.close()
+
+        return jsonify(result)
+
+    except Exception as e:
+        logger.error(f"Smart home error: {e}", exc_info=True)
+        return jsonify({"error": "Failed to process smart home command"}), 500
+
+
+@app.route('/smart_home/devices', methods=['GET'])
+def smart_home_devices():
+    """
+    Get list of Home Assistant devices.
+    Optional query param: domain (e.g., 'light', 'switch', 'climate')
+    """
+    if not HA_ENABLED:
+        return jsonify({"error": "Home Assistant integration is not enabled"}), 400
+
+    domain = request.args.get('domain')
+
+    try:
+        client = get_homeassistant_client()
+        if not client or not client.is_configured:
+            return jsonify({"error": "Home Assistant not configured"}), 500
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            devices = loop.run_until_complete(client.get_devices(domain))
+        finally:
+            loop.close()
+
+        return jsonify({
+            "devices": [
+                {
+                    "entity_id": d.entity_id,
+                    "friendly_name": d.friendly_name,
+                    "domain": d.domain,
+                    "state": d.state,
+                    "is_on": d.is_on
+                }
+                for d in devices
+            ],
+            "count": len(devices)
+        })
+
+    except Exception as e:
+        logger.error(f"Failed to get devices: {e}", exc_info=True)
+        return jsonify({"error": "Failed to get devices"}), 500
+
+
+@app.route('/smart_home/health', methods=['GET'])
+def smart_home_health():
+    """Check Home Assistant connection health"""
+    if not HA_ENABLED:
+        return jsonify({
+            "enabled": False,
+            "connected": False,
+            "message": "Home Assistant integration is disabled"
+        })
+
+    try:
+        client = get_homeassistant_client()
+        if not client:
+            return jsonify({
+                "enabled": True,
+                "configured": False,
+                "connected": False,
+                "message": "Home Assistant client not initialized"
+            })
+
+        if not client.is_configured:
+            return jsonify({
+                "enabled": True,
+                "configured": False,
+                "connected": False,
+                "message": "Set HA_TOKEN environment variable"
+            })
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            is_healthy = loop.run_until_complete(client.check_health())
+        finally:
+            loop.close()
+
+        return jsonify({
+            "enabled": True,
+            "configured": True,
+            "connected": is_healthy,
+            "url": client.url
+        })
+
+    except Exception as e:
+        logger.error(f"Home Assistant health check failed: {e}")
+        return jsonify({
+            "enabled": True,
+            "configured": True,
+            "connected": False,
+            "error": str(e)
+        })
 
 
 @app.route('/tts', methods=['POST'])
@@ -451,9 +685,14 @@ def tts():
             "output_path": output_path
         })
 
+    except ValueError as e:
+        # Path validation errors are safe to show
+        logger.warning(f"TTS validation error: {e}")
+        return jsonify({"error": str(e)}), 400
     except Exception as e:
-        logger.error(f"TTS error: {e}")
-        return jsonify({"error": str(e)}), 500
+        # Log full error but return generic message
+        logger.error(f"TTS error: {e}", exc_info=True)
+        return jsonify({"error": "Failed to generate speech"}), 500
 
 
 def main():
@@ -469,13 +708,17 @@ def main():
     print(f"  Balanced: {MODELS['balanced']}")
     print(f"  Powerful: {MODELS['powerful']}")
     print(f"\nEndpoints:")
-    print(f"  GET  /health      - Health check with service status")
-    print(f"  GET  /status      - Full system status")
-    print(f"  GET  /mode        - Get current mode")
-    print(f"  POST /mode        - Set conversation mode")
-    print(f"  POST /query       - Process audio query")
-    print(f"  POST /text_query  - Process text query")
-    print(f"  POST /tts         - Generate speech")
+    print(f"  GET  /health              - Health check with service status")
+    print(f"  GET  /status              - Full system status")
+    print(f"  GET  /mode                - Get current mode")
+    print(f"  POST /mode                - Set conversation mode")
+    print(f"  POST /query               - Process audio query")
+    print(f"  POST /text_query          - Process text query")
+    print(f"  POST /tts                 - Generate speech")
+    print(f"  POST /smart_home          - Process smart home command")
+    print(f"  GET  /smart_home/devices  - List Home Assistant devices")
+    print(f"  GET  /smart_home/health   - Check Home Assistant status")
+    print(f"\nHome Assistant: {'Enabled' if HA_ENABLED else 'Disabled'}")
     print(f"\nStarting on 0.0.0.0:{config['servers']['orchestrator']['port']}...")
     print("=" * 60 + "\n")
 

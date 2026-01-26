@@ -5,8 +5,11 @@ class OrchestratorClient {
     private let baseURL: URL
 
     // MARK: - Initialization
-    init(host: String = "localhost", port: Int = 5000) {
-        self.baseURL = URL(string: "http://\(host):\(port)")!
+    init(host: String = "localhost", port: Int = 5001) {
+        guard let url = URL(string: "http://\(host):\(port)") else {
+            preconditionFailure("Invalid Orchestrator URL: http://\(host):\(port)")
+        }
+        self.baseURL = url
     }
 
     // MARK: - Health Check
@@ -118,6 +121,7 @@ enum OrchestratorError: Error, LocalizedError {
     case healthCheckFailed
     case processingFailed
     case modeChangeFailed
+    case serverNotAvailable
 
     var errorDescription: String? {
         switch self {
@@ -127,6 +131,8 @@ enum OrchestratorError: Error, LocalizedError {
             return "Failed to process query"
         case .modeChangeFailed:
             return "Failed to change conversation mode"
+        case .serverNotAvailable:
+            return "Required servers are not available. Please ensure Ollama is running."
         }
     }
 }

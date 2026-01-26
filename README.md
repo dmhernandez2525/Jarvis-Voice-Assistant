@@ -2,222 +2,326 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![Swift 5.9+](https://img.shields.io/badge/Swift-5.9+-orange.svg)](https://swift.org/)
 
-A powerful, fully offline voice assistant using:
+A powerful, fully offline voice assistant with **full duplex conversation** support:
+
+- **PersonaPlex** - Full duplex AI with <500ms latency (NEW!)
+- **VoiceForge** - Voice cloning and custom TTS (NEW!)
 - **Whisper Large** - State-of-the-art speech recognition
-- **Qwen 2.5:72b** - Maximum intelligence LLM (671B parameters)
-- **pyttsx3** - Text-to-speech
+- **Qwen 2.5:72b** - Maximum intelligence LLM
+- **Native macOS App** - Menu bar app with global hotkey (NEW!)
+
+## What's New: Full Duplex Conversation
+
+Jarvis now supports **full duplex conversation** - talk naturally like you're speaking with a human:
+
+| Feature | Legacy Mode | Full Duplex Mode |
+|---------|-------------|------------------|
+| Conversation Style | Turn-based | **Simultaneous** |
+| Response Latency | 2-5 seconds | **<500ms** |
+| Active Listening | None | **Back-channeling** |
+| Interruption | Must wait | **Natural interruption** |
+| Voice Cloning | None | **Clone any voice** |
+
+## Architecture
+
+```
++----------------------------------+
+|   Swift macOS Menu Bar App       |
+|   (JarvisApp - Option+Space)     |
++----------------+-----------------+
+                 | WebSocket + REST
+    +------------+------------+------------+
+    v            v            v            v
++--------+  +----------+  +----------+  +--------+
+|PersonaP|  |Orchestr. |  |VoiceForge|  | Ollama |
+|  :8998 |  |   :5001  |  |   :8765  |  | :11434 |
++--------+  +----------+  +----------+  +--------+
+```
 
 ## Hardware Requirements
 
-- **Minimum RAM**: 96 GB (for Qwen 2.5:72b)
+- **Minimum RAM**: 96 GB (for full Qwen 2.5:72b)
 - **Storage**: ~60 GB
-- **Recommended**: Apple M2 Max or similar
+- **Recommended**: Apple M2 Max or similar with 24GB+ unified memory
 
 ## Installation
 
-1. Install dependencies:
+### 1. Python Dependencies
+
 ```bash
-cd ~/voice-assistant
 pip3 install -r requirements.txt
+pip3 install -r requirements-orchestrator.txt
 ```
 
-2. Install additional audio libraries (macOS):
+### 2. Audio Libraries (macOS)
+
 ```bash
 brew install portaudio
 ```
 
-## Usage
+### 3. Swift App (Optional - for native macOS experience)
 
-### Wake Word Mode ("Jarvis")
-
-**RECOMMENDED - Two Options:**
-
-**Option 1: Simple Wake Word (No Setup Required)**
 ```bash
-python3 jarvis_simple_wakeword.py
+cd JarvisApp
+swift build
 ```
-- 100% offline, no API key needed
-- Uses Whisper to detect "Jarvis"
-- Slightly slower (~1-2s wake word detection)
 
-**Option 2: Porcupine Wake Word (Best Accuracy)**
+## Conversation Modes
+
+### Full Duplex Mode (Recommended)
+
+Uses PersonaPlex for natural, simultaneous conversation with <500ms latency.
+
 ```bash
-python3 jarvis_with_wakeword.py
-```
-- Requires free Porcupine access key (see `PORCUPINE_SETUP.md`)
-- Fastest wake word detection (<0.1s)
-- Still 100% offline after setup
+# Start the orchestrator
+python3 jarvis_orchestrator.py
 
-**With Home Assistant Integration:**
+# Or use the Swift app (Option+Space hotkey)
+./JarvisApp/.build/debug/JarvisApp
+```
+
+### Hybrid Mode
+
+Smart routing - simple queries go to PersonaPlex, complex queries to Ollama.
+
 ```bash
-python3 jarvis_homeassistant.py
+curl -X POST http://localhost:5001/mode \
+  -H "Content-Type: application/json" \
+  -d '{"mode": "hybrid"}'
 ```
-(Also requires Porcupine access key)
 
-### Interactive Mode (Local Mac)
+### Legacy Mode
 
-Run the basic voice assistant on this Mac (no wake word):
+Traditional STT -> LLM -> TTS pipeline for maximum intelligence.
 
 ```bash
 python3 voice_assistant.py
 ```
 
-Press Enter to record 5 seconds of audio, then the assistant will respond.
+## Native macOS App (JarvisApp)
 
-### API Server Mode (For Remote Devices)
+A beautiful menu bar app with:
 
-Run as a server that remote devices can connect to:
+- **Global Hotkey**: Option+Space to start/stop listening
+- **Status Icons**: Visual feedback (idle/listening/processing/speaking)
+- **Mode Switching**: Quick toggle between conversation modes
+- **Voice Profiles**: Switch between cloned voices
+- **Server Management**: Auto-start/stop backend services
+
+### Building the App
+
+```bash
+cd JarvisApp
+swift build -c release
+```
+
+### Running
+
+```bash
+# Debug build
+swift run
+
+# Or after building
+./.build/debug/JarvisApp
+```
+
+## Voice Cloning with VoiceForge
+
+Clone any voice from a 3-10 second audio sample:
+
+### 1. Start VoiceForge Server
+
+```bash
+# From the voiceforge repository
+cd ../voiceforge/python-backend
+python3 server.py
+```
+
+### 2. Create a Voice Profile
+
+```bash
+# Save a voice profile
+curl -X POST http://localhost:8765/generate/clone \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Hello, this is my cloned voice",
+    "ref_audio_path": "~/voice_profiles/sample.wav",
+    "ref_text": "This is a sample of my voice",
+    "language": "English"
+  }'
+```
+
+### 3. Use Voice Profile
+
+Voice profiles are stored in `~/voice_profiles/` and can be selected in the Swift app.
+
+## Orchestrator API
+
+The central orchestrator runs on port 5001 and routes between services:
+
+### Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/health` | GET | Health check with service status |
+| `/status` | GET | Full system status |
+| `/mode` | GET/POST | Get or set conversation mode |
+| `/query` | POST | Process audio query |
+| `/text_query` | POST | Process text query |
+| `/tts` | POST | Generate speech |
+
+### Examples
+
+```bash
+# Health check
+curl http://localhost:5001/health
+
+# Text query
+curl -X POST http://localhost:5001/text_query \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Hello Jarvis"}'
+
+# Audio query
+curl -X POST http://localhost:5001/query \
+  -F "audio=@recording.wav"
+
+# Change mode
+curl -X POST http://localhost:5001/mode \
+  -H "Content-Type: application/json" \
+  -d '{"mode": "full_duplex"}'
+```
+
+## Legacy Modes
+
+### Wake Word Mode ("Jarvis")
+
+**Option 1: Simple Wake Word (No Setup Required)**
+```bash
+python3 jarvis_simple_wakeword.py
+```
+
+**Option 2: Porcupine Wake Word (Best Accuracy)**
+```bash
+python3 jarvis_with_wakeword.py
+```
+
+### API Server Mode
 
 ```bash
 python3 voice_assistant_server.py
 ```
 
-Server runs on `http://0.0.0.0:5000`
+## Configuration
 
-#### API Endpoints:
+Edit `config/jarvis.yaml` to customize:
 
-1. **Health Check**
-   ```bash
-   curl http://SERVER_IP:5000/health
-   ```
+```yaml
+# Conversation Modes
+modes:
+  full_duplex:
+    backend: "personaplex"
+  hybrid:
+    backends: ["personaplex", "ollama"]
+  legacy:
+    backend: "ollama"
 
-2. **Text Query** (for testing)
-   ```bash
-   curl -X POST http://SERVER_IP:5000/text_query \
-     -H "Content-Type: application/json" \
-     -d '{"text": "What is the capital of France?"}'
-   ```
+# LLM Models
+models:
+  router: "qwen2.5:7b"
+  fast: "dolphin-mistral:7b"
+  balanced: "qwen2.5:32b"
+  powerful: "qwen2.5:72b"
 
-3. **Audio Query** (returns JSON with text)
-   ```bash
-   curl -X POST http://SERVER_IP:5000/query \
-     -F "audio=@recording.wav"
-   ```
+# TTS Settings
+defaults:
+  tts_speaker: "Ryan"
+  tts_language: "English"
+```
 
-4. **Audio Query** (returns spoken audio)
-   ```bash
-   curl -X POST http://SERVER_IP:5000/query_audio \
-     -F "audio=@recording.wav" \
-     -o response.wav
-   ```
+## Environment Variables
 
-### Test Client
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `HF_TOKEN` | HuggingFace token for PersonaPlex | Required |
+| `JARVIS_ROOT` | Jarvis project directory | Auto-detected |
+| `VOICEFORGE_ROOT` | VoiceForge project directory | Auto-detected |
+| `PYTHON_PATH` | Python executable path | `/usr/bin/python3` |
+| `DOCKER_PATH` | Docker executable path | `/usr/local/bin/docker` |
+| `CORS_ORIGINS` | Allowed CORS origins | `http://localhost:*` |
+| `VOICEFORGE_ALLOWED_DIRS` | Allowed voice profile directories | `~/voice_profiles` |
+| `HA_URL` | Home Assistant URL | None |
+| `HA_TOKEN` | Home Assistant long-lived token | None |
 
-Test the server from any device on your network:
+## PersonaPlex Setup (Full Duplex)
+
+PersonaPlex enables full duplex conversation with <500ms latency.
+
+### 1. Run Setup Script
 
 ```bash
-# Update SERVER_URL in test_client.py to your server's IP
-python3 test_client.py
+./setup_personaplex.sh
 ```
 
-## For Custom Hardware Integration
+### 2. Configure HuggingFace Token
 
-### Hardware Setup
+PersonaPlex requires a HuggingFace token:
 
-For custom Echo-like devices with microphone and speaker:
+1. Accept the model license: https://huggingface.co/nvidia/personaplex-7b-v1
+2. Create a token: https://huggingface.co/settings/tokens
+3. Set the token:
 
-1. **Microphone** → Record audio (WAV format, 16kHz recommended)
-2. **Send audio** → POST to `/query_audio` endpoint
-3. **Receive audio** → Play response through speaker
-
-### Example with Raspberry Pi
-
-```python
-import requests
-import pyaudio
-
-SERVER = "http://192.168.1.100:5000"
-
-# Record audio
-# ... your recording code ...
-
-# Send to server
-with open('recording.wav', 'rb') as f:
-    response = requests.post(
-        f"{SERVER}/query_audio",
-        files={'audio': f}
-    )
-
-# Play response
-# ... play response.content as audio ...
+```bash
+echo 'export HF_TOKEN=hf_your_token_here' >> ~/.zshrc
+source ~/.zshrc
 ```
 
-### Wake Word Detection (Optional)
+### 3. Start PersonaPlex Server
 
-For always-on devices, add wake word detection before sending to server:
-- Use **Porcupine** or **Snowboy** for local wake word detection
-- Only send audio to server after wake word detected
+```bash
+./run_personaplex.sh
+```
 
-## Network Configuration
-
-1. Find your Mac's IP address:
-   ```bash
-   ifconfig | grep inet
-   ```
-
-2. Ensure port 5000 is accessible on your network
-
-3. For multiple devices, consider:
-   - Static IP for the server
-   - Router port forwarding (if needed)
-   - Firewall rules
+See [docs/PERSONAPLEX_SETUP.md](docs/PERSONAPLEX_SETUP.md) for detailed instructions.
 
 ## Performance
 
-- **Response Time**: 2-5 seconds typical
-  - Transcription: 0.5-1s
-  - LLM inference: 1-3s
-  - TTS: 0.5-1s
-
-- **Concurrent Requests**: Server handles one request at a time
-  - For multiple devices, consider request queuing
-
-## Future Enhancements
-
-1. **Wake word detection** for always-on mode
-2. **Voice cloning** for custom TTS voices
-3. **Context memory** for multi-turn conversations
-4. **Smart home integration** (HomeKit, Home Assistant)
-5. **Multiple language support**
-
-### Coming Soon: Full Duplex Conversation (PersonaPlex Integration)
-
-We're planning to integrate NVIDIA's **PersonaPlex** - an open-source full duplex conversational AI model that will revolutionize how Jarvis interacts:
-
-| Feature | Current | With PersonaPlex |
-|---------|---------|------------------|
-| Conversation Style | Turn-based (you speak, then Jarvis) | **Simultaneous** (natural overlap) |
-| Response Latency | 2-5 seconds | **<500ms** |
-| Active Listening | None | **Back-channeling** ("uh-huh", "right", "okay") |
-| Interruption | Must wait for response | **Natural mid-sentence interruption** |
-
-**What is Full Duplex?**
-Unlike traditional voice assistants that have strict user→agent→user turns, PersonaPlex listens and speaks simultaneously - just like a real human conversation. It can acknowledge what you're saying while you speak, and you can interrupt it naturally.
-
-**Technical Details:**
-- 7B parameter model based on Moshi architecture
-- Uses MIMI neural audio codec
-- Runs locally on 24GB+ VRAM (Mac M2 Max compatible)
-- Open source under Apache 2.0 license
-
-See `roadmap/PHASE_5_PERSONAPLEX.md` for implementation details.
+| Mode | Response Time | Best For |
+|------|---------------|----------|
+| Full Duplex | <500ms | Natural conversation |
+| Hybrid | 500ms - 3s | General use |
+| Legacy | 2-5s | Complex queries |
 
 ## Troubleshooting
 
-- **"No module named 'pyaudio'"**: Install portaudio first: `brew install portaudio`
-- **Slow responses**: Normal for 72B model, reduce to 32B for faster responses
-- **Memory issues**: Ensure no other heavy applications running
+- **"No module named 'pyaudio'"**: `brew install portaudio`
+- **Slow responses**: Reduce model size in config
+- **Memory issues**: Close other applications
+- **Swift build fails**: Run `swift package resolve` first
+- **PersonaPlex not connecting**: Ensure Docker is running
 
-## Model Selection
+## Project Structure
 
-To use different models, edit the scripts:
+```
+jarvis-voice-assistant/
++-- JarvisApp/                 # Native macOS Swift app
+|   +-- Sources/
+|   |   +-- Core/              # JarvisCore, AudioPipeline, Clients
+|   |   +-- Views/             # StatusBarController
+|   |   +-- Services/          # ServerManager, HotKeyManager
+|   |   +-- Models/            # ConversationMode, JarvisState
+|   +-- Package.swift
++-- config/
+|   +-- jarvis.yaml            # Central configuration
++-- voice_profiles/            # Voice cloning profiles
++-- jarvis_orchestrator.py     # Central routing server
++-- personaplex_client.py      # PersonaPlex WebSocket client
++-- voiceforge_tts.py          # VoiceForge TTS wrapper
++-- voice_assistant.py         # Legacy voice assistant
++-- docker-compose.personaplex.yml
+```
 
-**Faster responses** (less intelligent):
-- Change `qwen2.5:72b` → `qwen2.5:32b` or `qwen2.5:14b`
+## License
 
-**Better transcription** (larger size):
-- Keep `whisper large`
-
-**Faster transcription** (lower accuracy):
-- Change `whisper large` → `whisper medium` or `whisper small`
+MIT License - see [LICENSE](LICENSE) for details.

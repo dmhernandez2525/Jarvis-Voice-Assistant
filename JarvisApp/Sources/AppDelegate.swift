@@ -17,15 +17,33 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Application Lifecycle
     func applicationDidFinishLaunching(_ notification: Notification) {
+        logInfo("JarvisApp starting up", category: .general)
+        logInfo("System: \(ProcessInfo.processInfo.operatingSystemVersionString)", category: .general)
+
         setupStatusBar()
+        logDebug("Status bar initialized", category: .ui)
+
         setupHotKey()
+        logDebug("Hotkey registered (Option+Space)", category: .ui)
+
         setupCore()
+        logDebug("JarvisCore initialized", category: .general)
+
         startServers()
+        logInfo("Server manager started", category: .network)
+
+        // Create desktop shortcut on first run
+        DesktopShortcut.createIfNeeded()
+
+        logInfo("JarvisApp startup complete", category: .general)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        logInfo("JarvisApp shutting down", category: .general)
         jarvisCore?.stopConversation()
         serverManager?.stopAllServers()
+        JarvisLogger.shared.flush()
+        logInfo("JarvisApp terminated", category: .general)
     }
 
     // MARK: - Setup Methods
@@ -33,8 +51,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         if let button = statusItem.button {
-            button.image = iconIdle
-            button.image?.isTemplate = true
+            // Use text title for visibility, with icon if available
+            button.title = " Jarvis"
+            if let icon = iconIdle {
+                button.image = icon
+                button.image?.isTemplate = true
+                button.imagePosition = .imageLeading
+                logDebug("Using SF Symbol icon with text", category: .ui)
+            } else {
+                logWarning("SF Symbol not available, using text only", category: .ui)
+            }
+        } else {
+            logError("Failed to get status item button")
         }
 
         let menu = NSMenu()
@@ -75,16 +103,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(NSMenuItem.separator())
 
+        // Conversation Window
+        menu.addItem(NSMenuItem(title: "Show Conversation Window", action: #selector(showConversationWindow), keyEquivalent: "j"))
+
         // Dashboard
         menu.addItem(NSMenuItem(title: "Show Dashboard...", action: #selector(showDashboard), keyEquivalent: "d"))
         menu.addItem(NSMenuItem(title: "Settings...", action: #selector(showSettings), keyEquivalent: ","))
+        menu.addItem(NSMenuItem(title: "View Logs...", action: #selector(viewLogs), keyEquivalent: "l"))
 
         menu.addItem(NSMenuItem.separator())
 
         // Server status submenu
         let serverMenu = NSMenu()
         serverMenu.addItem(createServerStatusItem(name: "PersonaPlex", port: 8998))
-        serverMenu.addItem(createServerStatusItem(name: "Orchestrator", port: 5000))
+        serverMenu.addItem(createServerStatusItem(name: "Orchestrator", port: 5001))
         serverMenu.addItem(createServerStatusItem(name: "VoiceForge", port: 8765))
         serverMenu.addItem(createServerStatusItem(name: "Ollama", port: 11434))
         serverMenu.addItem(NSMenuItem.separator())
@@ -118,6 +150,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func setupCore() {
         jarvisCore = JarvisCore()
         jarvisCore.delegate = self
+
+        // Listen for stop conversation notifications from the window
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleStopConversation),
+            name: .stopConversation,
+            object: nil
+        )
+    }
+
+    @objc private func handleStopConversation() {
+        if jarvisCore.isActive {
+            toggleConversation()
+        }
     }
 
     private func startServers() {
@@ -129,20 +175,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Actions
     @objc private func toggleConversation() {
         if jarvisCore.isActive {
+            logInfo("Stopping conversation", category: .audio)
             jarvisCore.stopConversation()
             updateState(.idle)
             updateToggleButton(isActive: false)
+            ConversationWindowController.shared.updateState(.idle)
         } else {
+            logInfo("Starting conversation", category: .audio)
+            // Show conversation window
+            ConversationWindowController.shared.show()
+            ConversationWindowController.shared.updateState(.listening)
+
             Task {
                 do {
                     try await jarvisCore.startConversation()
                     await MainActor.run {
+                        logInfo("Conversation started successfully", category: .audio)
                         updateState(.listening)
                         updateToggleButton(isActive: true)
                     }
                 } catch {
                     await MainActor.run {
+                        logError("Failed to start conversation", error: error)
                         updateState(.error(error.localizedDescription))
+                        ConversationWindowController.shared.updateState(.error(error.localizedDescription))
                         showError("Failed to start conversation: \(error.localizedDescription)")
                     }
                 }
@@ -151,37 +207,58 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func setModeFullDuplex() {
+        logInfo("Mode changed to Full Duplex", category: .general)
         jarvisCore.setMode(.fullDuplex)
     }
 
     @objc private func setModeHybrid() {
+        logInfo("Mode changed to Hybrid", category: .general)
         jarvisCore.setMode(.hybrid)
     }
 
     @objc private func setModeLegacy() {
+        logInfo("Mode changed to Legacy", category: .general)
         jarvisCore.setMode(.legacy)
     }
 
     @objc private func showVoiceProfiles() {
-        // TODO: Show voice profile selection window
-        print("Show voice profiles")
+        logDebug("Voice profiles requested (not yet implemented)", category: .ui)
+    }
+
+    @objc private func showConversationWindow() {
+        logDebug("Showing conversation window", category: .ui)
+        ConversationWindowController.shared.show()
     }
 
     @objc private func showDashboard() {
-        // TODO: Show conversation dashboard window
-        print("Show dashboard")
+        logDebug("Dashboard requested (not yet implemented)", category: .ui)
     }
 
     @objc private func showSettings() {
-        // TODO: Show settings window
-        print("Show settings")
+        logDebug("Settings requested (not yet implemented)", category: .ui)
+    }
+
+    @objc private func viewLogs() {
+        logDebug("Opening logs folder", category: .ui)
+        if let logPath = JarvisLogger.shared.currentLogPath {
+            let logURL = URL(fileURLWithPath: logPath)
+            NSWorkspace.shared.selectFile(logPath, inFileViewerRootedAtPath: logURL.deletingLastPathComponent().path)
+        } else {
+            // Fallback to opening Application Support
+            if let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+                let logsDir = appSupport.appendingPathComponent("JarvisApp/Logs")
+                NSWorkspace.shared.open(logsDir)
+            }
+        }
     }
 
     @objc private func restartServers() {
+        logInfo("Restarting all servers", category: .network)
         serverManager.restartAllServers()
     }
 
     @objc private func quitApp() {
+        logInfo("Quit requested by user", category: .general)
         NSApplication.shared.terminate(nil)
     }
 
@@ -230,36 +307,71 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 // MARK: - JarvisCoreDelegate
 extension AppDelegate: JarvisCoreDelegate {
     func jarvisCore(_ core: JarvisCore, didChangeState state: JarvisState) {
+        logDebug("State changed to: \(state.description)", category: .general)
         DispatchQueue.main.async {
             self.updateState(state)
+            ConversationWindowController.shared.updateState(state)
+        }
+    }
+
+    func jarvisCore(_ core: JarvisCore, didChangeState state: JarvisState, detail: String?) {
+        logDebug("State changed to: \(state.description), detail: \(detail ?? "none")", category: .general)
+        DispatchQueue.main.async {
+            self.updateState(state)
+            ConversationWindowController.shared.updateState(state)
+            if let detail = detail {
+                ConversationWindowController.shared.updateStatusDetail(detail)
+            }
         }
     }
 
     func jarvisCore(_ core: JarvisCore, didReceiveTranscription text: String) {
-        print("User: \(text)")
+        logInfo("User said: \(text)", category: .audio)
+        DispatchQueue.main.async {
+            ConversationWindowController.shared.addUserMessage(text)
+        }
     }
 
     func jarvisCore(_ core: JarvisCore, didReceiveResponse text: String) {
-        print("Jarvis: \(text)")
+        logInfo("Jarvis response complete: \(text.prefix(100))...", category: .audio)
+        DispatchQueue.main.async {
+            // Just finalize the streaming message - the text is already displayed
+            // Don't add a duplicate message
+            ConversationWindowController.shared.finalizeStreamingMessage()
+        }
+    }
+
+    func jarvisCore(_ core: JarvisCore, didReceivePartialResponse text: String) {
+        // Update streaming message bubble with accumulated text
+        ConversationWindowController.shared.updateStreamingMessage(text)
     }
 
     func jarvisCore(_ core: JarvisCore, didEncounterError error: Error) {
+        logError("JarvisCore error", error: error)
         DispatchQueue.main.async {
             self.updateState(.error(error.localizedDescription))
+            ConversationWindowController.shared.updateState(.error(error.localizedDescription))
             self.showError(error.localizedDescription)
         }
+    }
+
+    func jarvisCore(_ core: JarvisCore, didUpdateAudioLevel level: Float) {
+        // Update waveform visualization with actual audio level
+        ConversationWindowController.shared.updateAudioLevel(level)
     }
 }
 
 // MARK: - ServerManagerDelegate
 extension AppDelegate: ServerManagerDelegate {
     func serverManager(_ manager: ServerManager, serverDidStart name: String, port: Int) {
+        logInfo("Server started: \(name) on port \(port)", category: .network)
         DispatchQueue.main.async {
             self.updateServerStatus(port: port, isOnline: true)
         }
     }
 
     func serverManager(_ manager: ServerManager, serverDidStop name: String, port: Int) {
+        logWarning("Server stopped: \(name) on port \(port)", category: .network)
         DispatchQueue.main.async {
             self.updateServerStatus(port: port, isOnline: false)
         }

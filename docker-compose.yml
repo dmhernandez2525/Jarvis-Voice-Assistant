@@ -1,0 +1,110 @@
+# Jarvis Voice Assistant - Main Docker Compose
+# Run with: docker-compose up -d
+#
+# This includes the main Flask server for voice processing.
+# For PersonaPlex, use: docker-compose -f docker-compose.personaplex.yml up -d
+
+services:
+  jarvis:
+    build: .
+    container_name: jarvis-server
+    ports:
+      - "5000:5000"
+    volumes:
+      # Configuration (read-only)
+      - ./config:/app/config:ro
+      # Logs directory
+      - ./logs:/app/logs
+    environment:
+      - PYTHONUNBUFFERED=1
+      - FLASK_ENV=production
+      # Ollama connection (if using local Ollama)
+      - OLLAMA_URL=${OLLAMA_URL:-http://ollama:11434}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen2.5:72b}
+      # Home Assistant integration (optional)
+      - HA_URL=${HA_URL:-}
+      - HA_TOKEN=${HA_TOKEN:-}
+      # VoiceForge TTS (optional)
+      - VOICEFORGE_URL=${VOICEFORGE_URL:-http://voiceforge:8765}
+      # PersonaPlex (optional)
+      - PERSONAPLEX_URL=${PERSONAPLEX_URL:-http://personaplex:8998}
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: jarvis-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    # Uncomment for NVIDIA GPU support
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  # Optional: VoiceForge TTS service
+  voiceforge:
+    image: voiceforge:latest
+    container_name: jarvis-voiceforge
+    ports:
+      - "8765:8765"
+    volumes:
+      - voiceforge-cache:/app/cache
+    profiles:
+      - with-tts
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8765/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Optional: Redis for caching
+  redis:
+    image: redis:7-alpine
+    container_name: jarvis-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    profiles:
+      - with-cache
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  ollama-data:
+    driver: local
+  voiceforge-cache:
+    driver: local
+  redis-data:
+    driver: local
+
+networks:
+  default:
+    name: jarvis-network
+    driver: bridge

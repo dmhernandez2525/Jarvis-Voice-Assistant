@@ -5,7 +5,7 @@
 servers:
   orchestrator:
     host: "127.0.0.1"
-    port: 5000
+    port: 5001  # Changed from 5000 (used by macOS AirPlay)
 
   voiceforge:
     host: "127.0.0.1"
@@ -72,6 +72,32 @@ defaults:
 health_check:
   interval_seconds: 5
   timeout_seconds: 2
+
+# Home Assistant Integration
+home_assistant:
+  enabled: true
+  url: null  # Set via HA_URL env var or here: "http://homeassistant.local:8123"
+  token: null  # Set via HA_TOKEN env var (recommended) or here
+  timeout: 10.0
+
+  # Smart home command keywords that trigger Home Assistant routing
+  trigger_keywords:
+    - "turn on"
+    - "turn off"
+    - "switch on"
+    - "switch off"
+    - "lights"
+    - "thermostat"
+    - "temperature"
+    - "lock"
+    - "unlock"
+    - "garage"
+    - "blinds"
+    - "curtains"
+    - "fan"
+    - "tv"
+    - "scene"
+    - "automation"
 
 # Logging
 logging:
