@@ -1,0 +1,45 @@
+# Docker Compose for PersonaPlex Server
+# Run with: docker-compose -f docker-compose.personaplex.yml up -d
+
+version: '3.8'
+
+services:
+  personaplex:
+    image: personaplex:latest
+    container_name: jarvis-personaplex
+    ports:
+      - "8998:8998"
+    volumes:
+      - ./config:/app/config:ro
+      - personaplex-cache:/app/cache
+    environment:
+      - PERSONAPLEX_HOST=0.0.0.0
+      - PERSONAPLEX_PORT=8998
+      - PERSONAPLEX_LOG_LEVEL=INFO
+      # For Apple Silicon Macs
+      - PYTORCH_ENABLE_MPS_FALLBACK=1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8998/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    # Uncomment for NVIDIA GPU support
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+volumes:
+  personaplex-cache:
+    driver: local
+
+# Network configuration for internal services
+networks:
+  default:
+    name: jarvis-network
+    driver: bridge
