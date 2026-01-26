@@ -1,0 +1,62 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background circle with gradient -->
+  <defs>
+    <linearGradient id="bgGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1a1a2e;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#16213e;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="glowGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#00d4ff;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#0099cc;stop-opacity:1" />
+    </linearGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="20" result="coloredBlur"/>
+      <feMerge>
+        <feMergeNode in="coloredBlur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Main circle background -->
+  <circle cx="512" cy="512" r="480" fill="url(#bgGradient)" stroke="url(#glowGradient)" stroke-width="8"/>
+
+  <!-- Inner glow ring -->
+  <circle cx="512" cy="512" r="420" fill="none" stroke="url(#glowGradient)" stroke-width="2" opacity="0.3"/>
+
+  <!-- Stylized "J" for Jarvis -->
+  <path d="M 580 250
+           L 580 620
+           Q 580 750 450 750
+           Q 320 750 320 620
+           L 320 580"
+        fill="none"
+        stroke="url(#glowGradient)"
+        stroke-width="60"
+        stroke-linecap="round"
+        filter="url(#glow)"/>
+
+  <!-- Top bar of J -->
+  <line x1="450" y1="250" x2="700" y2="250"
+        stroke="url(#glowGradient)"
+        stroke-width="60"
+        stroke-linecap="round"
+        filter="url(#glow)"/>
+
+  <!-- Microphone accent dots (representing audio waves) -->
+  <circle cx="220" cy="400" r="15" fill="#00d4ff" opacity="0.8"/>
+  <circle cx="200" cy="500" r="20" fill="#00d4ff" opacity="0.6"/>
+  <circle cx="220" cy="600" r="15" fill="#00d4ff" opacity="0.8"/>
+
+  <circle cx="804" cy="400" r="15" fill="#00d4ff" opacity="0.8"/>
+  <circle cx="824" cy="500" r="20" fill="#00d4ff" opacity="0.6"/>
+  <circle cx="804" cy="600" r="15" fill="#00d4ff" opacity="0.8"/>
+
+  <!-- AI circuit pattern accent -->
+  <g opacity="0.15" stroke="#00d4ff" stroke-width="2" fill="none">
+    <path d="M 150 300 L 200 300 L 200 350"/>
+    <path d="M 150 700 L 200 700 L 200 650"/>
+    <path d="M 874 300 L 824 300 L 824 350"/>
+    <path d="M 874 700 L 824 700 L 824 650"/>
+  </g>
+</svg>

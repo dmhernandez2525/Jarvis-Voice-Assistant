@@ -21,6 +21,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         setupHotKey()
         setupCore()
         startServers()
+
+        // Create desktop shortcut on first run
+        DesktopShortcut.createIfNeeded()
     }
 
     func applicationWillTerminate(_ notification: Notification) {

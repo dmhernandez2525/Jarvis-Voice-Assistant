@@ -45,7 +45,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app)
+
+# Security: Limit request size to 50MB for audio uploads
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50 MB
+
+# Security: Configure CORS for local development only
+# In production, specify allowed origins
+ALLOWED_ORIGINS = os.environ.get("CORS_ORIGINS", "http://localhost:*,http://127.0.0.1:*")
+CORS(app, origins=ALLOWED_ORIGINS.split(",") if ALLOWED_ORIGINS != "*" else "*")
 
 # Load configuration
 CONFIG_PATH = Path(__file__).parent / "config" / "jarvis.yaml"
@@ -281,6 +288,14 @@ def mode():
     })
 
 
+def validate_wav_header(data: bytes) -> bool:
+    """Validate that data starts with a WAV file header."""
+    if len(data) < 12:
+        return False
+    # WAV files start with "RIFF" and contain "WAVE"
+    return data[:4] == b'RIFF' and data[8:12] == b'WAVE'
+
+
 @app.route('/query', methods=['POST'])
 def query():
     """
@@ -300,8 +315,18 @@ def query():
     else:
         audio_data = request.files['audio'].read()
 
+    # Security: Validate audio data
+    if not audio_data:
+        return jsonify({"error": "Empty audio data"}), 400
+
+    if len(audio_data) < 44:  # Minimum WAV header size
+        return jsonify({"error": "Audio data too small"}), 400
+
+    if not validate_wav_header(audio_data):
+        return jsonify({"error": "Invalid audio format - expected WAV"}), 400
+
     # Save temporarily for Whisper
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False, mode='wb') as f:
         temp_path = f.name
         f.write(audio_data)
 
@@ -451,9 +476,14 @@ def tts():
             "output_path": output_path
         })
 
+    except ValueError as e:
+        # Path validation errors are safe to show
+        logger.warning(f"TTS validation error: {e}")
+        return jsonify({"error": str(e)}), 400
     except Exception as e:
-        logger.error(f"TTS error: {e}")
-        return jsonify({"error": str(e)}), 500
+        # Log full error but return generic message
+        logger.error(f"TTS error: {e}", exc_info=True)
+        return jsonify({"error": "Failed to generate speech"}), 500
 
 
 def main():

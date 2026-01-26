@@ -10,6 +10,7 @@ Features:
 - Multiple language support
 """
 
+import os
 import json
 import logging
 import base64
@@ -19,6 +20,40 @@ from dataclasses import dataclass
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# Security: Allowed directories for voice profile audio files
+# Can be overridden via VOICEFORGE_ALLOWED_DIRS environment variable
+DEFAULT_ALLOWED_DIRS = [
+    Path.home() / "voice_profiles",
+    Path.home() / "Desktop" / "Projects" / "PersonalProjects" / "jarvis-voice-assistant" / "voice_profiles",
+]
+
+def get_allowed_dirs() -> List[Path]:
+    """Get list of allowed directories for voice profile audio files."""
+    env_dirs = os.environ.get("VOICEFORGE_ALLOWED_DIRS")
+    if env_dirs:
+        return [Path(d.strip()).resolve() for d in env_dirs.split(":") if d.strip()]
+    return [d.resolve() for d in DEFAULT_ALLOWED_DIRS]
+
+def validate_audio_path(path: str) -> Path:
+    """
+    Validate that an audio file path is within allowed directories.
+    Raises ValueError if path is outside allowed directories.
+    """
+    resolved_path = Path(path).resolve()
+    allowed_dirs = get_allowed_dirs()
+
+    for allowed_dir in allowed_dirs:
+        try:
+            resolved_path.relative_to(allowed_dir)
+            return resolved_path
+        except ValueError:
+            continue
+
+    raise ValueError(
+        f"Audio file path '{path}' is not within allowed directories. "
+        f"Allowed: {[str(d) for d in allowed_dirs]}"
+    )
 
 
 @dataclass
@@ -222,8 +257,8 @@ class VoiceForgeTTS:
 
         logger.info(f"Generating cloned voice from: {ref_audio}")
 
-        # Read and encode reference audio
-        ref_audio_path = Path(ref_audio)
+        # Security: Validate path is within allowed directories
+        ref_audio_path = validate_audio_path(ref_audio)
         if not ref_audio_path.exists():
             raise FileNotFoundError(f"Reference audio not found: {ref_audio}")
 
@@ -326,9 +361,18 @@ class VoiceForgeTTS:
             try:
                 with open(profile_file) as f:
                     data = json.load(f)
+
+                    # Security: Validate the audio path is within allowed directories
+                    audio_path = data.get("reference_audio_path", "")
+                    try:
+                        validate_audio_path(audio_path)
+                    except ValueError as ve:
+                        logger.warning(f"Skipping profile {profile_file}: {ve}")
+                        continue
+
                     profile = VoiceProfile(
                         name=data["name"],
-                        reference_audio_path=data["reference_audio_path"],
+                        reference_audio_path=audio_path,
                         reference_text=data.get("reference_text", ""),
                         language=data.get("language", "English")
                     )

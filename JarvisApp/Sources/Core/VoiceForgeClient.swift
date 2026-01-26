@@ -7,7 +7,10 @@ class VoiceForgeClient {
 
     // MARK: - Initialization
     init(host: String = "localhost", port: Int = 8765) {
-        self.baseURL = URL(string: "http://\(host):\(port)")!
+        guard let url = URL(string: "http://\(host):\(port)") else {
+            preconditionFailure("Invalid VoiceForge URL: http://\(host):\(port)")
+        }
+        self.baseURL = url
     }
 
     // MARK: - Health Check

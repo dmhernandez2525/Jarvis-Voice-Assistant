@@ -6,7 +6,10 @@ class OrchestratorClient {
 
     // MARK: - Initialization
     init(host: String = "localhost", port: Int = 5000) {
-        self.baseURL = URL(string: "http://\(host):\(port)")!
+        guard let url = URL(string: "http://\(host):\(port)") else {
+            preconditionFailure("Invalid Orchestrator URL: http://\(host):\(port)")
+        }
+        self.baseURL = url
     }
 
     // MARK: - Health Check

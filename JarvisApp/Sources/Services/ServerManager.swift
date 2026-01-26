@@ -17,15 +17,50 @@ class ServerManager {
 
     private let jarvisRoot: URL
     private let voiceforgeRoot: URL
+    private let pythonPath: String
+    private let dockerPath: String
 
     // MARK: - Initialization
     init() {
-        // Find project roots
+        // Find project roots from environment variables or defaults
         let homeDir = FileManager.default.homeDirectoryForCurrentUser
-        self.jarvisRoot = homeDir
-            .appendingPathComponent("Desktop/Projects/PersonalProjects/jarvis-voice-assistant")
-        self.voiceforgeRoot = homeDir
-            .appendingPathComponent("Desktop/Projects/PersonalProjects/voiceforge")
+
+        // JARVIS_ROOT can be set via environment variable
+        if let jarvisEnv = ProcessInfo.processInfo.environment["JARVIS_ROOT"] {
+            self.jarvisRoot = URL(fileURLWithPath: jarvisEnv)
+        } else {
+            self.jarvisRoot = homeDir
+                .appendingPathComponent("Desktop/Projects/PersonalProjects/jarvis-voice-assistant")
+        }
+
+        // VOICEFORGE_ROOT can be set via environment variable
+        if let voiceforgeEnv = ProcessInfo.processInfo.environment["VOICEFORGE_ROOT"] {
+            self.voiceforgeRoot = URL(fileURLWithPath: voiceforgeEnv)
+        } else {
+            self.voiceforgeRoot = homeDir
+                .appendingPathComponent("Desktop/Projects/PersonalProjects/voiceforge")
+        }
+
+        // Python path from environment or common locations
+        self.pythonPath = ProcessInfo.processInfo.environment["PYTHON_PATH"]
+            ?? ServerManager.findExecutable("python3")
+            ?? "/usr/bin/python3"
+
+        // Docker path from environment or common locations
+        self.dockerPath = ProcessInfo.processInfo.environment["DOCKER_PATH"]
+            ?? ServerManager.findExecutable("docker")
+            ?? "/usr/local/bin/docker"
+    }
+
+    /// Find executable in common paths
+    private static func findExecutable(_ name: String) -> String? {
+        let paths = [
+            "/usr/local/bin/\(name)",
+            "/usr/bin/\(name)",
+            "/opt/homebrew/bin/\(name)",
+            "/opt/local/bin/\(name)"
+        ]
+        return paths.first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
     deinit {
@@ -70,13 +105,14 @@ class ServerManager {
         }
 
         orchestratorProcess = Process()
-        orchestratorProcess?.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        orchestratorProcess?.executableURL = URL(fileURLWithPath: pythonPath)
         orchestratorProcess?.arguments = [scriptPath.path]
         orchestratorProcess?.currentDirectoryURL = jarvisRoot
 
         orchestratorProcess?.terminationHandler = { [weak self] _ in
             DispatchQueue.main.async {
-                self?.delegate?.serverManager(self!, serverDidStop: "Orchestrator", port: 5000)
+                guard let self = self else { return }
+                self.delegate?.serverManager(self, serverDidStop: "Orchestrator", port: 5000)
             }
         }
 
@@ -100,13 +136,14 @@ class ServerManager {
         }
 
         voiceforgeProcess = Process()
-        voiceforgeProcess?.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        voiceforgeProcess?.executableURL = URL(fileURLWithPath: pythonPath)
         voiceforgeProcess?.arguments = [scriptPath.path]
         voiceforgeProcess?.currentDirectoryURL = voiceforgeRoot.appendingPathComponent("python-backend")
 
         voiceforgeProcess?.terminationHandler = { [weak self] _ in
             DispatchQueue.main.async {
-                self?.delegate?.serverManager(self!, serverDidStop: "VoiceForge", port: 8765)
+                guard let self = self else { return }
+                self.delegate?.serverManager(self, serverDidStop: "VoiceForge", port: 8765)
             }
         }
 
@@ -125,7 +162,7 @@ class ServerManager {
         // PersonaPlex runs in Docker
         // Check if Docker is running and the container exists
         let checkProcess = Process()
-        checkProcess.executableURL = URL(fileURLWithPath: "/usr/local/bin/docker")
+        checkProcess.executableURL = URL(fileURLWithPath: dockerPath)
         checkProcess.arguments = ["ps", "-q", "-f", "name=personaplex"]
 
         let pipe = Pipe()
@@ -154,7 +191,7 @@ class ServerManager {
 
     private func startPersonaPlexDocker() {
         personaplexProcess = Process()
-        personaplexProcess?.executableURL = URL(fileURLWithPath: "/usr/local/bin/docker")
+        personaplexProcess?.executableURL = URL(fileURLWithPath: dockerPath)
         personaplexProcess?.arguments = [
             "run", "-d",
             "--name", "personaplex",
@@ -166,7 +203,8 @@ class ServerManager {
         personaplexProcess?.terminationHandler = { [weak self] process in
             if process.terminationStatus == 0 {
                 DispatchQueue.main.async {
-                    self?.delegate?.serverManager(self!, serverDidStart: "PersonaPlex", port: 8998)
+                    guard let self = self else { return }
+                    self.delegate?.serverManager(self, serverDidStart: "PersonaPlex", port: 8998)
                 }
             }
         }
