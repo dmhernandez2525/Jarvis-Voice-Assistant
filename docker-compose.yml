@@ -1,3 +1,5 @@
+name: jarvis-voice-assistant
+
 # Jarvis Voice Assistant - Main Docker Compose
 # Run with: docker-compose up -d
 #
