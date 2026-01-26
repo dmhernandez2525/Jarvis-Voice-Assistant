@@ -51,8 +51,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         if let button = statusItem.button {
-            button.image = iconIdle
-            button.image?.isTemplate = true
+            // Try to use SF Symbol, fall back to text if not available
+            if let icon = iconIdle {
+                button.image = icon
+                button.image?.isTemplate = true
+                logDebug("Using SF Symbol icon", category: .ui)
+            } else {
+                // Fallback to text title if SF Symbol not available
+                button.title = "J"
+                logWarning("SF Symbol not available, using text fallback", category: .ui)
+            }
+        } else {
+            logError("Failed to get status item button")
         }
 
         let menu = NSMenu()
