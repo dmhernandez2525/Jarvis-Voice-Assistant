@@ -16,21 +16,13 @@ class DesktopShortcut {
             return
         }
 
-        // Get the app bundle path
-        guard let appPath = Bundle.main.bundlePath as String? else {
-            print("Could not determine app bundle path")
+        // Get the executable path (works for both debug and release builds)
+        guard let executablePath = Bundle.main.executablePath else {
+            print("Could not determine executable path")
             return
         }
 
-        // For debug builds, create shortcut to the built executable
-        let executablePath: String
-        if appPath.contains(".build") {
-            // Running from swift build
-            executablePath = appPath
-        } else {
-            // Running as a proper app bundle
-            executablePath = appPath
-        }
+        let appPath = Bundle.main.bundlePath
 
         // Create alias on desktop
         let desktopPath = FileManager.default.homeDirectoryForCurrentUser
