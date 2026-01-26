@@ -13,7 +13,7 @@ class JarvisCore {
     weak var delegate: JarvisCoreDelegate?
 
     private(set) var isActive = false
-    private(set) var currentMode: ConversationMode = .hybrid
+    private(set) var currentMode: ConversationMode = .legacy  // Default to legacy (Ollama only) - no PersonaPlex needed
 
     private let audioPipeline: AudioPipeline
     private let personaPlexClient: PersonaPlexClient

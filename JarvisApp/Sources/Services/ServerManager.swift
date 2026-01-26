@@ -103,7 +103,7 @@ class ServerManager {
         healthCheckTimer?.invalidate()
         healthCheckTimer = nil
 
-        stopProcess(&orchestratorProcess, name: "Orchestrator", port: 5000)
+        stopProcess(&orchestratorProcess, name: "Orchestrator", port: 5001)
         stopProcess(&voiceforgeProcess, name: "VoiceForge", port: 8765)
         stopProcess(&personaplexProcess, name: "PersonaPlex", port: 8998)
     }
@@ -135,7 +135,7 @@ class ServerManager {
             logWarning("Orchestrator terminated with code \(process.terminationStatus)", category: .network)
             DispatchQueue.main.async {
                 guard let self = self else { return }
-                self.delegate?.serverManager(self, serverDidStop: "Orchestrator", port: 5000)
+                self.delegate?.serverManager(self, serverDidStop: "Orchestrator", port: 5001)
             }
         }
 
@@ -143,7 +143,7 @@ class ServerManager {
             try orchestratorProcess?.run()
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
                 guard let self = self else { return }
-                self.delegate?.serverManager(self, serverDidStart: "Orchestrator", port: 5000)
+                self.delegate?.serverManager(self, serverDidStart: "Orchestrator", port: 5001)
             }
         } catch {
             logError("Failed to start orchestrator", error: error)
@@ -264,7 +264,7 @@ class ServerManager {
     private func performHealthChecks() {
         Task {
             // Check Orchestrator
-            await checkServer(url: "http://localhost:5000/health", name: "Orchestrator", port: 5000)
+            await checkServer(url: "http://localhost:5001/health", name: "Orchestrator", port: 5001)
 
             // Check VoiceForge
             await checkServer(url: "http://localhost:8765/health", name: "VoiceForge", port: 8765)

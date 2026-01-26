@@ -113,7 +113,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Server status submenu
         let serverMenu = NSMenu()
         serverMenu.addItem(createServerStatusItem(name: "PersonaPlex", port: 8998))
-        serverMenu.addItem(createServerStatusItem(name: "Orchestrator", port: 5000))
+        serverMenu.addItem(createServerStatusItem(name: "Orchestrator", port: 5001))
         serverMenu.addItem(createServerStatusItem(name: "VoiceForge", port: 8765))
         serverMenu.addItem(createServerStatusItem(name: "Ollama", port: 11434))
         serverMenu.addItem(NSMenuItem.separator())
