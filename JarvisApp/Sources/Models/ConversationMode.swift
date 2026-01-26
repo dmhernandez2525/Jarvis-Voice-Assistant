@@ -90,4 +90,19 @@ enum JarvisState: Equatable {
             return "exclamationmark.triangle"
         }
     }
+
+    var description: String {
+        switch self {
+        case .idle:
+            return "Idle"
+        case .listening:
+            return "Listening..."
+        case .processing:
+            return "Processing..."
+        case .speaking:
+            return "Speaking..."
+        case .error(let message):
+            return "Error: \(message)"
+        }
+    }
 }

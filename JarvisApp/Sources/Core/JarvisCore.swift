@@ -2,16 +2,10 @@ import Foundation
 import AVFoundation
 
 protocol JarvisCoreDelegate: AnyObject {
-    func jarvisCore(_ core: JarvisCore, didChangeStatus status: JarvisStatus)
+    func jarvisCore(_ core: JarvisCore, didChangeState state: JarvisState)
     func jarvisCore(_ core: JarvisCore, didReceiveTranscription text: String)
     func jarvisCore(_ core: JarvisCore, didReceiveResponse text: String)
     func jarvisCore(_ core: JarvisCore, didEncounterError error: Error)
-}
-
-enum ConversationMode: String, Codable {
-    case fullDuplex = "full_duplex"
-    case hybrid = "hybrid"
-    case legacy = "legacy"
 }
 
 class JarvisCore {
@@ -69,7 +63,7 @@ class JarvisCore {
     func startConversation() async throws {
         guard !isActive else { return }
 
-        delegate?.jarvisCore(self, didChangeStatus: .listening)
+        delegate?.jarvisCore(self, didChangeState: .listening)
 
         switch currentMode {
         case .fullDuplex:
@@ -93,7 +87,7 @@ class JarvisCore {
         audioPipeline.stopCapture()
 
         isActive = false
-        delegate?.jarvisCore(self, didChangeStatus: .idle)
+        delegate?.jarvisCore(self, didChangeState: .idle)
     }
 
     func setMode(_ mode: ConversationMode) {
@@ -172,7 +166,7 @@ class JarvisCore {
     }
 
     private func processWithOrchestrator(_ audioData: Data) async {
-        delegate?.jarvisCore(self, didChangeStatus: .processing)
+        delegate?.jarvisCore(self, didChangeState: .processing)
 
         do {
             // Send audio to orchestrator
@@ -182,11 +176,11 @@ class JarvisCore {
             delegate?.jarvisCore(self, didReceiveResponse: response.response)
 
             // Generate speech with VoiceForge
-            delegate?.jarvisCore(self, didChangeStatus: .speaking)
+            delegate?.jarvisCore(self, didChangeState: .speaking)
             let audioURL = try await voiceForgeClient.generateSpeech(text: response.response)
             audioPipeline.playAudioFile(audioURL)
 
-            delegate?.jarvisCore(self, didChangeStatus: .listening)
+            delegate?.jarvisCore(self, didChangeState: .listening)
         } catch {
             delegate?.jarvisCore(self, didEncounterError: error)
         }

@@ -130,19 +130,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func toggleConversation() {
         if jarvisCore.isActive {
             jarvisCore.stopConversation()
-            updateStatus(.idle)
+            updateState(.idle)
             updateToggleButton(isActive: false)
         } else {
             Task {
                 do {
                     try await jarvisCore.startConversation()
                     await MainActor.run {
-                        updateStatus(.listening)
+                        updateState(.listening)
                         updateToggleButton(isActive: true)
                     }
                 } catch {
                     await MainActor.run {
-                        updateStatus(.error)
+                        updateState(.error(error.localizedDescription))
                         showError("Failed to start conversation: \(error.localizedDescription)")
                     }
                 }
@@ -186,10 +186,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: - UI Updates
-    private func updateStatus(_ status: JarvisStatus) {
+    private func updateState(_ state: JarvisState) {
         guard let button = statusItem.button else { return }
 
-        switch status {
+        switch state {
         case .idle:
             button.image = iconIdle
         case .listening:
@@ -206,7 +206,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Update status text in menu
         if let menu = statusItem.menu,
            let statusItem = menu.item(withTag: 100) {
-            statusItem.title = "Jarvis - \(status.description)"
+            statusItem.title = "Jarvis - \(state.description)"
         }
     }
 
@@ -229,9 +229,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
 // MARK: - JarvisCoreDelegate
 extension AppDelegate: JarvisCoreDelegate {
-    func jarvisCore(_ core: JarvisCore, didChangeStatus status: JarvisStatus) {
+    func jarvisCore(_ core: JarvisCore, didChangeState state: JarvisState) {
         DispatchQueue.main.async {
-            self.updateStatus(status)
+            self.updateState(state)
         }
     }
 
@@ -245,7 +245,7 @@ extension AppDelegate: JarvisCoreDelegate {
 
     func jarvisCore(_ core: JarvisCore, didEncounterError error: Error) {
         DispatchQueue.main.async {
-            self.updateStatus(.error)
+            self.updateState(.error(error.localizedDescription))
             self.showError(error.localizedDescription)
         }
     }
@@ -281,21 +281,3 @@ extension AppDelegate: ServerManagerDelegate {
     }
 }
 
-// MARK: - Supporting Types
-enum JarvisStatus {
-    case idle
-    case listening
-    case processing
-    case speaking
-    case error
-
-    var description: String {
-        switch self {
-        case .idle: return "Idle"
-        case .listening: return "Listening..."
-        case .processing: return "Processing..."
-        case .speaking: return "Speaking..."
-        case .error: return "Error"
-        }
-    }
-}
