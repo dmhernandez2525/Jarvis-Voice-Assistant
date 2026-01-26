@@ -1,0 +1,29 @@
+# Jarvis Orchestrator Dependencies
+# Install with: pip install -r requirements-orchestrator.txt
+
+# Web framework
+flask>=3.0.0
+flask-cors>=4.0.0
+
+# HTTP client
+httpx>=0.27.0
+
+# WebSocket client
+websockets>=12.0
+
+# Speech-to-text
+openai-whisper>=20231117
+
+# LLM
+ollama>=0.3.0
+
+# Configuration
+pyyaml>=6.0
+
+# Audio processing
+numpy>=1.24.0
+scipy>=1.11.0
+soundfile>=0.12.0
+
+# Async support
+asyncio-compat>=0.1.0

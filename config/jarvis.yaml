@@ -1,0 +1,79 @@
+# Jarvis Voice Assistant Configuration
+# Central configuration for all Jarvis services
+
+# Server Ports
+servers:
+  orchestrator:
+    host: "127.0.0.1"
+    port: 5000
+
+  voiceforge:
+    host: "127.0.0.1"
+    port: 8765
+
+  personaplex:
+    host: "127.0.0.1"
+    port: 8998
+    websocket_path: "/ws"
+
+  ollama:
+    host: "127.0.0.1"
+    port: 11434
+
+# LLM Models
+models:
+  router: "qwen2.5:7b"          # Fast model for routing decisions
+  fast: "dolphin-mistral:7b"    # Fast, uncensored for simple queries
+  balanced: "qwen2.5:32b"       # Balanced performance
+  powerful: "qwen2.5:72b"       # Maximum intelligence
+
+# Whisper Configuration
+whisper:
+  model: "large"
+  language: "en"
+  device: "auto"  # auto, cpu, cuda, mps
+
+# Audio Settings
+audio:
+  sample_rate: 16000
+  channels: 1
+  buffer_size: 1024
+  format: "float32"
+
+# Conversation Modes
+modes:
+  full_duplex:
+    name: "Full Duplex"
+    description: "PersonaPlex only - <500ms latency, natural conversation"
+    backend: "personaplex"
+
+  hybrid:
+    name: "Hybrid"
+    description: "Smart routing between PersonaPlex and Ollama"
+    backends: ["personaplex", "ollama"]
+    routing:
+      # PersonaPlex handles conversational, Ollama handles complex
+      simple_threshold: 0.7
+      complex_threshold: 0.3
+
+  legacy:
+    name: "Legacy"
+    description: "Traditional STT -> LLM -> TTS pipeline"
+    backend: "ollama"
+
+# Default Settings
+defaults:
+  mode: "hybrid"
+  voice_profile: null  # Use default VoiceForge speaker
+  tts_speaker: "Ryan"
+  tts_language: "English"
+
+# Health Check
+health_check:
+  interval_seconds: 5
+  timeout_seconds: 2
+
+# Logging
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
