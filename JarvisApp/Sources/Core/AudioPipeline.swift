@@ -4,6 +4,7 @@ import AVFoundation
 class AudioPipeline {
     // MARK: - Properties
     var onAudioCaptured: ((Data) -> Void)?
+    var onAudioLevelUpdated: ((Float) -> Void)?
 
     // Capture engine
     private var captureEngine: AVAudioEngine?
@@ -78,6 +79,8 @@ class AudioPipeline {
         isCapturing = false
     }
 
+    private var audioChunkCount = 0
+
     private func processInputBuffer(_ inputBuffer: AVAudioPCMBuffer, converter: AVAudioConverter, outputFormat: AVAudioFormat) {
         // Calculate the output frame capacity
         let ratio = outputFormat.sampleRate / inputBuffer.format.sampleRate
@@ -103,6 +106,24 @@ class AudioPipeline {
         if let channelData = outputBuffer.floatChannelData?[0] {
             let frameLength = Int(outputBuffer.frameLength)
             let data = Data(bytes: channelData, count: frameLength * MemoryLayout<Float>.size)
+
+            // Calculate RMS audio level for visualization
+            var sumOfSquares: Float = 0
+            for i in 0..<frameLength {
+                let sample = channelData[i]
+                sumOfSquares += sample * sample
+            }
+            let rms = sqrt(sumOfSquares / Float(frameLength))
+            // Scale RMS to 0-1 range (typical speech RMS is 0.01-0.3)
+            let normalizedLevel = min(1.0, rms * 5.0)
+            onAudioLevelUpdated?(normalizedLevel)
+
+            // Log every 50th chunk to see activity
+            audioChunkCount += 1
+            if audioChunkCount % 50 == 0 {
+                logInfo("Audio captured: chunk #\(audioChunkCount), \(data.count) bytes, level: \(normalizedLevel)", category: .audio)
+            }
+
             onAudioCaptured?(data)
         }
     }
@@ -194,16 +215,14 @@ class AudioPipeline {
                 return
             }
 
-            // Stop any current playback
-            if node.isPlaying {
-                node.stop()
-            }
+            // For streaming audio, schedule buffers to queue up (don't stop previous!)
+            // This allows seamless playback of consecutive buffers
+            node.scheduleBuffer(buffer)
 
-            // Schedule and play the buffer
-            node.scheduleBuffer(buffer) { [weak self] in
-                logDebug("Audio playback completed", category: .audio)
+            // Start playing if not already playing
+            if !node.isPlaying {
+                node.play()
             }
-            node.play()
 
         } catch {
             logError("Failed to play buffer", error: error)

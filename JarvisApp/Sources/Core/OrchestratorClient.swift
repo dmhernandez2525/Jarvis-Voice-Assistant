@@ -121,6 +121,7 @@ enum OrchestratorError: Error, LocalizedError {
     case healthCheckFailed
     case processingFailed
     case modeChangeFailed
+    case serverNotAvailable
 
     var errorDescription: String? {
         switch self {
@@ -130,6 +131,8 @@ enum OrchestratorError: Error, LocalizedError {
             return "Failed to process query"
         case .modeChangeFailed:
             return "Failed to change conversation mode"
+        case .serverNotAvailable:
+            return "Required servers are not available. Please ensure Ollama is running."
         }
     }
 }

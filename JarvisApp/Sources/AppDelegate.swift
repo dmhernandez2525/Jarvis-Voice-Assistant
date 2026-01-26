@@ -51,15 +51,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         if let button = statusItem.button {
-            // Try to use SF Symbol, fall back to text if not available
+            // Use text title for visibility, with icon if available
+            button.title = " Jarvis"
             if let icon = iconIdle {
                 button.image = icon
                 button.image?.isTemplate = true
-                logDebug("Using SF Symbol icon", category: .ui)
+                button.imagePosition = .imageLeading
+                logDebug("Using SF Symbol icon with text", category: .ui)
             } else {
-                // Fallback to text title if SF Symbol not available
-                button.title = "J"
-                logWarning("SF Symbol not available, using text fallback", category: .ui)
+                logWarning("SF Symbol not available, using text only", category: .ui)
             }
         } else {
             logError("Failed to get status item button")
@@ -102,6 +102,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(voiceItem)
 
         menu.addItem(NSMenuItem.separator())
+
+        // Conversation Window
+        menu.addItem(NSMenuItem(title: "Show Conversation Window", action: #selector(showConversationWindow), keyEquivalent: "j"))
 
         // Dashboard
         menu.addItem(NSMenuItem(title: "Show Dashboard...", action: #selector(showDashboard), keyEquivalent: "d"))
@@ -147,6 +150,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func setupCore() {
         jarvisCore = JarvisCore()
         jarvisCore.delegate = self
+
+        // Listen for stop conversation notifications from the window
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleStopConversation),
+            name: .stopConversation,
+            object: nil
+        )
+    }
+
+    @objc private func handleStopConversation() {
+        if jarvisCore.isActive {
+            toggleConversation()
+        }
     }
 
     private func startServers() {
@@ -162,8 +179,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             jarvisCore.stopConversation()
             updateState(.idle)
             updateToggleButton(isActive: false)
+            ConversationWindowController.shared.updateState(.idle)
         } else {
             logInfo("Starting conversation", category: .audio)
+            // Show conversation window
+            ConversationWindowController.shared.show()
+            ConversationWindowController.shared.updateState(.listening)
+
             Task {
                 do {
                     try await jarvisCore.startConversation()
@@ -176,6 +198,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     await MainActor.run {
                         logError("Failed to start conversation", error: error)
                         updateState(.error(error.localizedDescription))
+                        ConversationWindowController.shared.updateState(.error(error.localizedDescription))
                         showError("Failed to start conversation: \(error.localizedDescription)")
                     }
                 }
@@ -200,6 +223,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func showVoiceProfiles() {
         logDebug("Voice profiles requested (not yet implemented)", category: .ui)
+    }
+
+    @objc private func showConversationWindow() {
+        logDebug("Showing conversation window", category: .ui)
+        ConversationWindowController.shared.show()
     }
 
     @objc private func showDashboard() {
@@ -282,23 +310,54 @@ extension AppDelegate: JarvisCoreDelegate {
         logDebug("State changed to: \(state.description)", category: .general)
         DispatchQueue.main.async {
             self.updateState(state)
+            ConversationWindowController.shared.updateState(state)
+        }
+    }
+
+    func jarvisCore(_ core: JarvisCore, didChangeState state: JarvisState, detail: String?) {
+        logDebug("State changed to: \(state.description), detail: \(detail ?? "none")", category: .general)
+        DispatchQueue.main.async {
+            self.updateState(state)
+            ConversationWindowController.shared.updateState(state)
+            if let detail = detail {
+                ConversationWindowController.shared.updateStatusDetail(detail)
+            }
         }
     }
 
     func jarvisCore(_ core: JarvisCore, didReceiveTranscription text: String) {
         logInfo("User said: \(text)", category: .audio)
+        DispatchQueue.main.async {
+            ConversationWindowController.shared.addUserMessage(text)
+        }
     }
 
     func jarvisCore(_ core: JarvisCore, didReceiveResponse text: String) {
-        logInfo("Jarvis response: \(text.prefix(100))...", category: .audio)
+        logInfo("Jarvis response complete: \(text.prefix(100))...", category: .audio)
+        DispatchQueue.main.async {
+            // Just finalize the streaming message - the text is already displayed
+            // Don't add a duplicate message
+            ConversationWindowController.shared.finalizeStreamingMessage()
+        }
+    }
+
+    func jarvisCore(_ core: JarvisCore, didReceivePartialResponse text: String) {
+        // Update streaming message bubble with accumulated text
+        ConversationWindowController.shared.updateStreamingMessage(text)
     }
 
     func jarvisCore(_ core: JarvisCore, didEncounterError error: Error) {
         logError("JarvisCore error", error: error)
         DispatchQueue.main.async {
             self.updateState(.error(error.localizedDescription))
+            ConversationWindowController.shared.updateState(.error(error.localizedDescription))
             self.showError(error.localizedDescription)
         }
+    }
+
+    func jarvisCore(_ core: JarvisCore, didUpdateAudioLevel level: Float) {
+        // Update waveform visualization with actual audio level
+        ConversationWindowController.shared.updateAudioLevel(level)
     }
 }
 

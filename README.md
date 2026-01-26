@@ -36,7 +36,7 @@ Jarvis now supports **full duplex conversation** - talk naturally like you're sp
     v            v            v            v
 +--------+  +----------+  +----------+  +--------+
 |PersonaP|  |Orchestr. |  |VoiceForge|  | Ollama |
-|  :8998 |  |   :5000  |  |   :8765  |  | :11434 |
+|  :8998 |  |   :5001  |  |   :8765  |  | :11434 |
 +--------+  +----------+  +----------+  +--------+
 ```
 
@@ -87,7 +87,7 @@ python3 jarvis_orchestrator.py
 Smart routing - simple queries go to PersonaPlex, complex queries to Ollama.
 
 ```bash
-curl -X POST http://localhost:5000/mode \
+curl -X POST http://localhost:5001/mode \
   -H "Content-Type: application/json" \
   -d '{"mode": "hybrid"}'
 ```
@@ -159,7 +159,7 @@ Voice profiles are stored in `~/voice_profiles/` and can be selected in the Swif
 
 ## Orchestrator API
 
-The central orchestrator runs on port 5000 and routes between services:
+The central orchestrator runs on port 5001 and routes between services:
 
 ### Endpoints
 
@@ -176,19 +176,19 @@ The central orchestrator runs on port 5000 and routes between services:
 
 ```bash
 # Health check
-curl http://localhost:5000/health
+curl http://localhost:5001/health
 
 # Text query
-curl -X POST http://localhost:5000/text_query \
+curl -X POST http://localhost:5001/text_query \
   -H "Content-Type: application/json" \
   -d '{"text": "Hello Jarvis"}'
 
 # Audio query
-curl -X POST http://localhost:5000/query \
+curl -X POST http://localhost:5001/query \
   -F "audio=@recording.wav"
 
 # Change mode
-curl -X POST http://localhost:5000/mode \
+curl -X POST http://localhost:5001/mode \
   -H "Content-Type: application/json" \
   -d '{"mode": "full_duplex"}'
 ```
@@ -244,20 +244,46 @@ defaults:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
+| `HF_TOKEN` | HuggingFace token for PersonaPlex | Required |
 | `JARVIS_ROOT` | Jarvis project directory | Auto-detected |
 | `VOICEFORGE_ROOT` | VoiceForge project directory | Auto-detected |
 | `PYTHON_PATH` | Python executable path | `/usr/bin/python3` |
 | `DOCKER_PATH` | Docker executable path | `/usr/local/bin/docker` |
 | `CORS_ORIGINS` | Allowed CORS origins | `http://localhost:*` |
 | `VOICEFORGE_ALLOWED_DIRS` | Allowed voice profile directories | `~/voice_profiles` |
+| `HA_URL` | Home Assistant URL | None |
+| `HA_TOKEN` | Home Assistant long-lived token | None |
 
-## Docker (PersonaPlex)
+## PersonaPlex Setup (Full Duplex)
 
-For PersonaPlex full duplex support:
+PersonaPlex enables full duplex conversation with <500ms latency.
+
+### 1. Run Setup Script
 
 ```bash
-docker-compose -f docker-compose.personaplex.yml up -d
+./setup_personaplex.sh
 ```
+
+### 2. Configure HuggingFace Token
+
+PersonaPlex requires a HuggingFace token:
+
+1. Accept the model license: https://huggingface.co/nvidia/personaplex-7b-v1
+2. Create a token: https://huggingface.co/settings/tokens
+3. Set the token:
+
+```bash
+echo 'export HF_TOKEN=hf_your_token_here' >> ~/.zshrc
+source ~/.zshrc
+```
+
+### 3. Start PersonaPlex Server
+
+```bash
+./run_personaplex.sh
+```
+
+See [docs/PERSONAPLEX_SETUP.md](docs/PERSONAPLEX_SETUP.md) for detailed instructions.
 
 ## Performance
 

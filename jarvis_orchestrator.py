@@ -261,7 +261,8 @@ def health():
 
     ollama_url = f"http://{config['servers']['ollama']['host']}:{config['servers']['ollama']['port']}/api/tags"
     voiceforge_url = f"http://{config['servers']['voiceforge']['host']}:{config['servers']['voiceforge']['port']}/health"
-    personaplex_url = f"http://{config['servers']['personaplex']['host']}:{config['servers']['personaplex']['port']}/health"
+    # PersonaPlex doesn't have a /health endpoint, check root URL instead
+    personaplex_url = f"http://{config['servers']['personaplex']['host']}:{config['servers']['personaplex']['port']}/"
 
     homeassistant_ok = False
     try:

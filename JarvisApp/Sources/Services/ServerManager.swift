@@ -124,10 +124,21 @@ class ServerManager {
             return
         }
 
+        // Use venv python if available
+        let venvPython = jarvisRoot.appendingPathComponent("venv/bin/python")
+        let actualPythonPath: String
+        if FileManager.default.isExecutableFile(atPath: venvPython.path) {
+            actualPythonPath = venvPython.path
+            logInfo("Using venv Python for Orchestrator", category: .network)
+        } else {
+            actualPythonPath = pythonPath
+            logWarning("Venv not found, using system Python for Orchestrator", category: .network)
+        }
+
         logInfo("Starting Orchestrator from \(scriptPath.path)", category: .network)
 
         orchestratorProcess = Process()
-        orchestratorProcess?.executableURL = URL(fileURLWithPath: pythonPath)
+        orchestratorProcess?.executableURL = URL(fileURLWithPath: actualPythonPath)
         orchestratorProcess?.arguments = [scriptPath.path]
         orchestratorProcess?.currentDirectoryURL = jarvisRoot
 
@@ -185,69 +196,132 @@ class ServerManager {
     }
 
     private func startPersonaPlex() {
-        logInfo("Checking PersonaPlex Docker container", category: .network)
+        logInfo("Starting PersonaPlex server (native mode)", category: .network)
 
-        // PersonaPlex runs in Docker
-        // Check if Docker is running and the container exists
-        let checkProcess = Process()
-        checkProcess.executableURL = URL(fileURLWithPath: dockerPath)
-        checkProcess.arguments = ["ps", "-q", "-f", "name=personaplex"]
+        // PersonaPlex runs natively on macOS (not Docker - no GPU passthrough on Mac)
+        let runScript = jarvisRoot.appendingPathComponent("run_personaplex.sh")
 
-        let pipe = Pipe()
-        checkProcess.standardOutput = pipe
+        // Check if setup has been done
+        let personaplexDir = jarvisRoot.appendingPathComponent("personaplex")
+        let venvPath = personaplexDir.appendingPathComponent("venv/bin/python")
 
-        do {
-            try checkProcess.run()
-            checkProcess.waitUntilExit()
+        guard FileManager.default.fileExists(atPath: personaplexDir.path) else {
+            logWarning("PersonaPlex not installed. Run ./setup_personaplex.sh first", category: .network)
+            logInfo("PersonaPlex will be skipped - using Legacy mode is recommended", category: .network)
+            // Don't fail - just skip PersonaPlex and let the app use legacy mode
+            return
+        }
 
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        // Check for HF_TOKEN
+        if ProcessInfo.processInfo.environment["HF_TOKEN"] == nil {
+            logWarning("HF_TOKEN not set - PersonaPlex requires HuggingFace authentication", category: .network)
+            logInfo("Set HF_TOKEN environment variable to enable PersonaPlex", category: .network)
+            return
+        }
 
-            if output.isEmpty {
-                // Container not running, start it
-                logInfo("PersonaPlex container not running, starting...", category: .network)
-                startPersonaPlexDocker()
-            } else {
-                // Container already running
-                logInfo("PersonaPlex container already running", category: .network)
-                delegate?.serverManager(self, serverDidStart: "PersonaPlex", port: 8998)
-            }
-        } catch {
-            logError("Docker check failed", error: error)
-            // Try to start anyway
-            startPersonaPlexDocker()
+        // Check if PersonaPlex is already running by checking the port
+        if isPortInUse(8998) {
+            logInfo("PersonaPlex already running on port 8998", category: .network)
+            delegate?.serverManager(self, serverDidStart: "PersonaPlex", port: 8998)
+            return
+        }
+
+        // Start PersonaPlex using the run script if it exists
+        if FileManager.default.fileExists(atPath: runScript.path) {
+            startPersonaPlexWithScript(runScript)
+        } else if FileManager.default.fileExists(atPath: venvPath.path) {
+            // Start directly using the venv
+            startPersonaPlexDirect(personaplexDir: personaplexDir, venvPath: venvPath)
+        } else {
+            logWarning("PersonaPlex venv not found. Run ./setup_personaplex.sh first", category: .network)
         }
     }
 
-    private func startPersonaPlexDocker() {
-        logInfo("Starting PersonaPlex Docker container", category: .network)
+    private func startPersonaPlexWithScript(_ scriptPath: URL) {
+        logInfo("Starting PersonaPlex with script: \(scriptPath.path)", category: .network)
 
         personaplexProcess = Process()
-        personaplexProcess?.executableURL = URL(fileURLWithPath: dockerPath)
-        personaplexProcess?.arguments = [
-            "run", "-d",
-            "--name", "personaplex",
-            "-p", "8998:8998",
-            "--rm",
-            "personaplex:latest"
-        ]
+        personaplexProcess?.executableURL = URL(fileURLWithPath: "/bin/bash")
+        personaplexProcess?.arguments = [scriptPath.path]
+        personaplexProcess?.currentDirectoryURL = jarvisRoot
+        personaplexProcess?.environment = ProcessInfo.processInfo.environment
+
+        // Capture output for logging
+        let outputPipe = Pipe()
+        let errorPipe = Pipe()
+        personaplexProcess?.standardOutput = outputPipe
+        personaplexProcess?.standardError = errorPipe
 
         personaplexProcess?.terminationHandler = { [weak self] process in
-            if process.terminationStatus == 0 {
-                logInfo("PersonaPlex Docker started successfully", category: .network)
-                DispatchQueue.main.async {
-                    guard let self = self else { return }
-                    self.delegate?.serverManager(self, serverDidStart: "PersonaPlex", port: 8998)
-                }
-            } else {
-                logWarning("PersonaPlex Docker exited with code \(process.terminationStatus)", category: .network)
+            logWarning("PersonaPlex terminated with code \(process.terminationStatus)", category: .network)
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.delegate?.serverManager(self, serverDidStop: "PersonaPlex", port: 8998)
             }
         }
 
         do {
             try personaplexProcess?.run()
+            // Give it time to start up before checking
+            DispatchQueue.main.asyncAfter(deadline: .now() + 10.0) { [weak self] in
+                guard let self = self else { return }
+                self.delegate?.serverManager(self, serverDidStart: "PersonaPlex", port: 8998)
+            }
         } catch {
-            logError("Failed to start PersonaPlex Docker", error: error)
+            logError("Failed to start PersonaPlex", error: error)
+        }
+    }
+
+    private func startPersonaPlexDirect(personaplexDir: URL, venvPath: URL) {
+        logInfo("Starting PersonaPlex directly with venv", category: .network)
+
+        personaplexProcess = Process()
+        personaplexProcess?.executableURL = venvPath
+        personaplexProcess?.arguments = [
+            "-m", "moshi.server",
+            "--port", "8998",
+            "--host", "0.0.0.0",
+            "--cpu-offload"  // Required for Mac (no NVIDIA GPU)
+        ]
+        personaplexProcess?.currentDirectoryURL = personaplexDir
+        personaplexProcess?.environment = ProcessInfo.processInfo.environment
+
+        personaplexProcess?.terminationHandler = { [weak self] process in
+            logWarning("PersonaPlex terminated with code \(process.terminationStatus)", category: .network)
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.delegate?.serverManager(self, serverDidStop: "PersonaPlex", port: 8998)
+            }
+        }
+
+        do {
+            try personaplexProcess?.run()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 15.0) { [weak self] in
+                guard let self = self else { return }
+                self.delegate?.serverManager(self, serverDidStart: "PersonaPlex", port: 8998)
+            }
+        } catch {
+            logError("Failed to start PersonaPlex", error: error)
+        }
+    }
+
+    private func isPortInUse(_ port: Int) -> Bool {
+        let checkProcess = Process()
+        checkProcess.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        checkProcess.arguments = ["-i", ":\(port)", "-P", "-n"]
+
+        let pipe = Pipe()
+        checkProcess.standardOutput = pipe
+        checkProcess.standardError = FileHandle.nullDevice
+
+        do {
+            try checkProcess.run()
+            checkProcess.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let output = String(data: data, encoding: .utf8) ?? ""
+            return !output.isEmpty
+        } catch {
+            return false
         }
     }
 
@@ -272,8 +346,8 @@ class ServerManager {
             // Check Ollama
             await checkServer(url: "http://localhost:11434/api/tags", name: "Ollama", port: 11434)
 
-            // Check PersonaPlex (WebSocket health endpoint)
-            await checkServer(url: "http://localhost:8998/health", name: "PersonaPlex", port: 8998)
+            // Check PersonaPlex (no /health endpoint, check root which returns HTML)
+            await checkServer(url: "http://localhost:8998/", name: "PersonaPlex", port: 8998)
         }
     }
 
