@@ -137,22 +137,43 @@ class DesktopShortcut {
             <true/>
             <key>NSHighResolutionCapable</key>
             <true/>
+            <key>CFBundleIconFile</key>
+            <string>AppIcon</string>
         </dict>
         </plist>
         """
         try plistContent.write(to: plistPath, atomically: true, encoding: .utf8)
 
-        // Copy icon if available
-        let iconSource = URL(fileURLWithPath: executablePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("Resources")
-            .appendingPathComponent("JarvisIcon.icns")
+        // Copy icon if available - check multiple locations
+        let iconDest = resourcesPath.appendingPathComponent("AppIcon.icns")
+        let possibleIconPaths = [
+            // Relative to executable (debug builds)
+            URL(fileURLWithPath: executablePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Resources")
+                .appendingPathComponent("JarvisIcon.icns"),
+            // JarvisApp/Resources directory
+            URL(fileURLWithPath: executablePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("JarvisApp")
+                .appendingPathComponent("Resources")
+                .appendingPathComponent("JarvisIcon.icns"),
+            // Current working directory
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent("Resources")
+                .appendingPathComponent("JarvisIcon.icns")
+        ]
 
-        if FileManager.default.fileExists(atPath: iconSource.path) {
-            let iconDest = resourcesPath.appendingPathComponent("AppIcon.icns")
-            try? FileManager.default.copyItem(at: iconSource, to: iconDest)
+        for iconSource in possibleIconPaths {
+            if FileManager.default.fileExists(atPath: iconSource.path) {
+                try? FileManager.default.copyItem(at: iconSource, to: iconDest)
+                break
+            }
         }
     }
 }
