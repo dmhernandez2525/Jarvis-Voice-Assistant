@@ -16,7 +16,7 @@ PersonaPlex is NVIDIA's full-duplex conversational AI that enables natural conve
 The setup script has already been run and installed PersonaPlex. If you need to reinstall:
 
 ```bash
-cd ~/Desktop/Projects/PersonalProjects/jarvis-voice-assistant
+cd ~/Desktop/Projects/jarvis-voice-assistant
 ./setup_personaplex.sh
 ```
 
@@ -52,7 +52,7 @@ PersonaPlex requires a HuggingFace token to download the model.
 ### 3. Start PersonaPlex Server
 
 ```bash
-cd ~/Desktop/Projects/PersonalProjects/jarvis-voice-assistant
+cd ~/Desktop/Projects/jarvis-voice-assistant
 ./run_personaplex.sh
 ```
 
