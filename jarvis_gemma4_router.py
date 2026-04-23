@@ -15,7 +15,6 @@ pinned torch/transformers/pillow/mlx; Ollama on the primary account at
 127.0.0.1:11434).
 """
 
-import logging
 import os
 import tempfile
 import time
@@ -26,11 +25,11 @@ import ollama
 import sounddevice as sd
 from scipy.io import wavfile
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
-logger = logging.getLogger("jarvis.gemma4")
+from jarvis_logging import setup_logging, write_session_summary
+
+# Configure logging, crash capture, faulthandler, and the structured event log.
+# Logs land in ~/Library/Logs/Jarvis-Gemma4/
+logger, events, SESSION_ID, SESSION_START = setup_logging(name="jarvis.gemma4")
 
 # Model configuration. Gemma 4 via Ollama (pulled 2026-04-23).
 ROUTER_MODEL = os.environ.get("JARVIS_ROUTER_MODEL", "gemma4:e2b")
@@ -95,13 +94,12 @@ class Gemma4Jarvis:
             result = self.stt.transcribe(wav_path)
         except Exception as e:
             logger.error("Parakeet transcription failed: %s", e, exc_info=True)
+            events.event("stt_error", wav=wav_path, error=str(e), exception_type=type(e).__name__)
             return ""
         text = result.text.strip() if hasattr(result, "text") else str(result).strip()
-        logger.info(
-            "Parakeet transcribe: %dms, %d chars",
-            int((time.time() - start) * 1000),
-            len(text),
-        )
+        duration_ms = int((time.time() - start) * 1000)
+        logger.info("Parakeet transcribe: %dms, %d chars", duration_ms, len(text))
+        events.event("stt_transcribe", duration_ms=duration_ms, text_len=len(text), text=text)
         return text
 
     def _audio_to_temp_wav(self, audio: np.ndarray) -> str:
@@ -142,12 +140,15 @@ class Gemma4Jarvis:
 
                 if "jarvis" in text:
                     logger.info("Wake word detected")
+                    events.event("wake_detected", text=text)
                     return True
                 else:
                     logger.info("False alarm, heard: %r", text)
+                    events.event("wake_false_alarm", text=text)
 
                 time.sleep(0.1)
         except KeyboardInterrupt:
+            events.event("wake_loop_interrupted")
             return False
 
     # ----- Command capture -----
@@ -203,6 +204,7 @@ class Gemma4Jarvis:
             )
         except Exception as e:
             logger.error("Router LLM call failed: %s", e, exc_info=True)
+            events.event("router_error", error=str(e), exception_type=type(e).__name__)
             # Fail open to balanced, not powerful: don't burn 31B on an error.
             return "balanced", BALANCED_MODEL
 
@@ -215,13 +217,18 @@ class Gemma4Jarvis:
         else:
             tier, model, eta = "powerful", POWERFUL_MODEL, "~15-30s"
 
+        duration_ms = int((time.time() - start) * 1000)
         logger.info(
             "Routing: %dms, class=%s -> tier=%s model=%s eta=%s",
-            int((time.time() - start) * 1000),
-            classification[:30],
-            tier,
-            model,
-            eta,
+            duration_ms, classification[:30], tier, model, eta,
+        )
+        events.event(
+            "router_decision",
+            duration_ms=duration_ms,
+            classification=classification[:30],
+            tier=tier,
+            model=model,
+            query_len=len(text),
         )
         return tier, model
 
@@ -246,6 +253,7 @@ class Gemma4Jarvis:
             )
         except Exception as e:
             logger.error("LLM call failed: %s", e, exc_info=True)
+            events.event("llm_error", tier=tier, model=model, error=str(e), exception_type=type(e).__name__)
             return "My apologies, sir. I encountered an error generating a response."
 
         answer = response["response"].strip()
@@ -258,6 +266,15 @@ class Gemma4Jarvis:
 
         logger.info("LLM inference: %dms", llm_ms)
         logger.info("JARVIS: %s", answer[:120] + ("..." if len(answer) > 120 else ""))
+        events.event(
+            "llm_response",
+            tier=tier,
+            model=model,
+            duration_ms=llm_ms,
+            input_len=len(text),
+            output_len=len(answer),
+            output_preview=answer[:200],
+        )
         return answer
 
     # ----- TTS -----
@@ -265,6 +282,7 @@ class Gemma4Jarvis:
     def speak(self, text: str) -> None:
         """Kokoro-82M -> WAV -> afplay via sounddevice."""
         logger.info("Speaking response (%d chars)", len(text))
+        events.event("tts_start", text_len=len(text))
         start = time.time()
 
         tmp_dir = tempfile.mkdtemp(prefix="jarvis-tts-")
@@ -282,12 +300,14 @@ class Gemma4Jarvis:
             )
         except Exception as e:
             logger.error("Kokoro TTS failed: %s", e, exc_info=True)
+            events.event("tts_error", error=str(e), exception_type=type(e).__name__)
             return
 
         # Kokoro emits `{prefix}_000.wav` and optionally more chunks; play them in order.
         wav_files = sorted(Path(tmp_dir).glob("utterance*.wav"))
         if not wav_files:
             logger.error("Kokoro produced no WAV output in %s", tmp_dir)
+            events.event("tts_no_output", tmp_dir=tmp_dir)
             return
 
         for wav in wav_files:
@@ -308,7 +328,14 @@ class Gemma4Jarvis:
         except OSError:
             pass
 
-        logger.info("TTS total: %dms", int((time.time() - start) * 1000))
+        tts_ms = int((time.time() - start) * 1000)
+        logger.info("TTS total: %dms", tts_ms)
+        events.event(
+            "tts_complete",
+            duration_ms=tts_ms,
+            text_len=len(text),
+            chunk_count=len(wav_files),
+        )
 
     # ----- Stats + loop -----
 
@@ -337,18 +364,40 @@ class Gemma4Jarvis:
 
                 if not text:
                     self.speak("I didn't catch that, sir.")
+                    events.event("empty_transcription")
                     continue
 
                 response = self.get_smart_response(text)
                 self.speak(response)
 
-                logger.info(
-                    "TOTAL round-trip: %dms",
-                    int((time.time() - total_start) * 1000),
-                )
+                roundtrip_ms = int((time.time() - total_start) * 1000)
+                logger.info("TOTAL round-trip: %dms", roundtrip_ms)
+                events.event("roundtrip_complete", duration_ms=roundtrip_ms)
         except KeyboardInterrupt:
-            logger.info("Shutting down Gemma 4 JARVIS")
+            logger.info("Shutting down Gemma 4 JARVIS (Ctrl+C)")
+            events.event("shutdown", reason="keyboard_interrupt")
             self.print_stats()
+        finally:
+            try:
+                summary_path = write_session_summary(
+                    session_id=SESSION_ID,
+                    start_time=SESSION_START,
+                    stats=self.stats,
+                    extra={
+                        "models": {
+                            "router": ROUTER_MODEL,
+                            "fast": FAST_MODEL,
+                            "balanced": BALANCED_MODEL,
+                            "powerful": POWERFUL_MODEL,
+                            "stt": STT_MODEL_ID,
+                            "tts": TTS_MODEL_ID,
+                            "voice": TTS_VOICE,
+                        },
+                    },
+                )
+                logger.info("Session summary written: %s", summary_path)
+            except Exception as e:
+                logger.error("Failed to write session summary: %s", e, exc_info=True)
 
 
 if __name__ == "__main__":
