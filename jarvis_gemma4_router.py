@@ -43,13 +43,34 @@ STT_MODEL_ID = os.environ.get(
 TTS_MODEL_ID = os.environ.get(
     "JARVIS_TTS_MODEL", "mlx-community/Kokoro-82M-bf16"
 )
-TTS_VOICE = os.environ.get("JARVIS_TTS_VOICE", "af_heart")
+TTS_VOICE = os.environ.get("JARVIS_TTS_VOICE", "am_michael")
+TTS_LANG_CODE = os.environ.get("JARVIS_TTS_LANG_CODE", "a")
 
-# Audio settings (match jarvis_smart_router.py so wake-word tuning carries over)
+# Routing mode: "direct" (default, always use balanced 26B) or "routed"
+# (classify first, then pick tier). Direct is ~5s faster per query because
+# it skips the e2b router cold-load cost.
+ROUTING_MODE = os.environ.get("JARVIS_MODE", "direct").lower()
+
+# Ollama keep_alive: how long to keep a model resident after a call. Longer
+# = faster next query but more memory held. 15m is a safe default on 96GB.
+OLLAMA_KEEP_ALIVE = os.environ.get("JARVIS_OLLAMA_KEEP_ALIVE", "15m")
+
+# Audio settings. All thresholds env-overridable.
 SAMPLE_RATE = 16000
-WAKE_THRESHOLD = 0.03
-WAKE_DURATION_S = 1.5
-COMMAND_DURATION_S = 15
+# Threshold lowered from 0.03 to 0.010 after real-world measurement showed
+# normal speech at mean ~0.015. 0.010 gives comfortable margin vs silence.
+WAKE_THRESHOLD = float(os.environ.get("JARVIS_WAKE_THRESHOLD", "0.010"))
+WAKE_DURATION_S = float(os.environ.get("JARVIS_WAKE_DURATION_S", "1.5"))
+
+# Command capture: silence-based end-of-speech detection.
+# Stops recording when COMMAND_SILENCE_S seconds of silence are heard after
+# at least one speech chunk, OR after COMMAND_MAX_S seconds total.
+COMMAND_MAX_S = float(os.environ.get("JARVIS_COMMAND_MAX_S", "10"))
+COMMAND_SILENCE_S = float(os.environ.get("JARVIS_COMMAND_SILENCE_S", "1.2"))
+COMMAND_CHUNK_S = float(os.environ.get("JARVIS_COMMAND_CHUNK_S", "0.2"))
+
+# Heartbeat cadence while waiting for wake word.
+WAKE_HEARTBEAT_EVERY = int(os.environ.get("JARVIS_WAKE_HEARTBEAT_EVERY", "4"))
 
 
 class Gemma4Jarvis:
@@ -113,9 +134,14 @@ class Gemma4Jarvis:
 
     def listen_for_wakeword(self) -> bool:
         """Energy-threshold wake detection, Parakeet verification for 'jarvis'."""
-        logger.info("Listening for wake word")
+        logger.info(
+            "Listening for wake word (threshold=%.4f, window=%.1fs)",
+            WAKE_THRESHOLD, WAKE_DURATION_S,
+        )
+        cycle = 0
         try:
             while True:
+                cycle += 1
                 audio = sd.rec(
                     int(WAKE_DURATION_S * SAMPLE_RATE),
                     samplerate=SAMPLE_RATE,
@@ -124,11 +150,29 @@ class Gemma4Jarvis:
                 )
                 sd.wait()
 
-                if np.abs(audio).mean() <= WAKE_THRESHOLD:
+                mean_abs = float(np.abs(audio).mean())
+
+                # Heartbeat: emit current audio level periodically so we can
+                # tell silence (mic permission missing) from "below threshold".
+                if cycle % WAKE_HEARTBEAT_EVERY == 0:
+                    peak = float(np.abs(audio).max())
+                    logger.info(
+                        "Mic heartbeat: mean=%.4f peak=%.4f threshold=%.4f cycle=%d",
+                        mean_abs, peak, WAKE_THRESHOLD, cycle,
+                    )
+                    events.event(
+                        "wake_heartbeat",
+                        mean_abs=mean_abs,
+                        peak_abs=peak,
+                        threshold=WAKE_THRESHOLD,
+                        cycle=cycle,
+                    )
+
+                if mean_abs <= WAKE_THRESHOLD:
                     time.sleep(0.1)
                     continue
 
-                logger.info("Sound detected, verifying wake word")
+                logger.info("Sound detected (mean=%.4f), verifying wake word", mean_abs)
                 wav_path = self._audio_to_temp_wav(audio.flatten())
                 try:
                     text = self.transcribe_wav(wav_path).lower()
@@ -153,19 +197,77 @@ class Gemma4Jarvis:
 
     # ----- Command capture -----
 
-    def listen_command(self, duration: float = COMMAND_DURATION_S) -> np.ndarray:
-        """Record the user's command from the default input device."""
-        logger.info("Recording command (%ds)", duration)
-        start = time.time()
-        recording = sd.rec(
-            int(duration * SAMPLE_RATE),
-            samplerate=SAMPLE_RATE,
-            channels=1,
-            dtype=np.float32,
+    def listen_command(self) -> np.ndarray:
+        """Record the user's command, stopping at end-of-speech.
+
+        Records in COMMAND_CHUNK_S windows. After at least one chunk above
+        WAKE_THRESHOLD (speech), stop once COMMAND_SILENCE_S of silence is
+        observed. Hard cap at COMMAND_MAX_S to bound runaway recording.
+        """
+        logger.info(
+            "Recording command (max=%.1fs, silence-end after %.1fs)",
+            COMMAND_MAX_S, COMMAND_SILENCE_S,
         )
-        sd.wait()
-        logger.info("Recording done in %dms", int((time.time() - start) * 1000))
-        return recording.flatten()
+        start = time.time()
+
+        chunk_samples = int(COMMAND_CHUNK_S * SAMPLE_RATE)
+        silence_chunks_needed = max(1, int(COMMAND_SILENCE_S / COMMAND_CHUNK_S))
+        max_chunks = int(COMMAND_MAX_S / COMMAND_CHUNK_S)
+
+        buffers: list[np.ndarray] = []
+        silence_count = 0
+        heard_speech = False
+        stopped_reason = "max_duration"
+
+        try:
+            stream = sd.InputStream(
+                samplerate=SAMPLE_RATE,
+                channels=1,
+                dtype=np.float32,
+                blocksize=chunk_samples,
+            )
+            stream.start()
+        except Exception as e:
+            logger.error("Could not open input stream: %s", e, exc_info=True)
+            events.event("command_stream_error", error=str(e))
+            return np.zeros(0, dtype=np.float32)
+
+        try:
+            for i in range(max_chunks):
+                data, _overflow = stream.read(chunk_samples)
+                chunk = data[:, 0].copy()
+                buffers.append(chunk)
+                mean_abs = float(np.abs(chunk).mean())
+
+                if mean_abs > WAKE_THRESHOLD:
+                    heard_speech = True
+                    silence_count = 0
+                elif heard_speech:
+                    silence_count += 1
+                    if silence_count >= silence_chunks_needed:
+                        stopped_reason = "silence_end"
+                        break
+        finally:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception as e:
+                logger.warning("Error closing input stream: %s", e)
+
+        audio = np.concatenate(buffers) if buffers else np.zeros(0, dtype=np.float32)
+        elapsed_ms = int((time.time() - start) * 1000)
+        logger.info(
+            "Recording done: %dms, %.1fs audio, reason=%s, speech=%s",
+            elapsed_ms, len(audio) / SAMPLE_RATE, stopped_reason, heard_speech,
+        )
+        events.event(
+            "command_recorded",
+            duration_ms=elapsed_ms,
+            audio_seconds=len(audio) / SAMPLE_RATE,
+            stopped_reason=stopped_reason,
+            heard_speech=heard_speech,
+        )
+        return audio
 
     def transcribe_command(self, audio: np.ndarray) -> str:
         """Transcribe the recorded command array."""
@@ -183,7 +285,15 @@ class Gemma4Jarvis:
     # ----- LLM -----
 
     def analyze_query_complexity(self, text: str) -> tuple[str, str]:
-        """Classify complexity. Returns (tier_name, ollama_model_tag)."""
+        """Classify complexity. Returns (tier_name, ollama_model_tag).
+
+        In direct mode (default), skip the classifier and go straight to the
+        balanced model. In routed mode, do the old e2b-based classification.
+        """
+        if ROUTING_MODE == "direct":
+            events.event("router_skipped", mode="direct", model=BALANCED_MODEL)
+            return "balanced", BALANCED_MODEL
+
         logger.info("Classifying query complexity")
         start = time.time()
 
@@ -200,6 +310,7 @@ class Gemma4Jarvis:
                 model=ROUTER_MODEL,
                 prompt=analysis_prompt,
                 stream=False,
+                keep_alive=OLLAMA_KEEP_ALIVE,
                 options={"temperature": 0.3},
             )
         except Exception as e:
@@ -249,6 +360,7 @@ class Gemma4Jarvis:
                 model=model,
                 prompt=prompt,
                 stream=False,
+                keep_alive=OLLAMA_KEEP_ALIVE,
                 options={"temperature": 0.8, "top_p": 0.9},
             )
         except Exception as e:
@@ -294,7 +406,7 @@ class Gemma4Jarvis:
                 voice=TTS_VOICE,
                 file_prefix=prefix,
                 audio_format="wav",
-                lang_code="a",
+                lang_code=TTS_LANG_CODE,
                 join_audio=True,
                 verbose=False,
             )
