@@ -233,8 +233,11 @@ class KokoroTTSService(TTSService):
                 "speed": self._speed,
             }
             t0 = time.time()
+            # Base URL already contains /v1 (OpenAI convention), so the
+            # relative path is just /audio/speech. Earlier this was
+            # /v1/audio/speech which produced /v1/v1/audio/speech and 404.
             async with client.stream(
-                "POST", "/v1/audio/speech", json=payload,
+                "POST", "/audio/speech", json=payload,
             ) as r:
                 if r.status_code != 200:
                     body = await r.aread()
