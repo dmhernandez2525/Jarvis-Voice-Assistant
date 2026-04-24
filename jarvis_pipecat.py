@@ -69,7 +69,11 @@ STT_MODEL_ID = os.environ.get(
 )
 
 LLM_BASE_URL = os.environ.get("JARVIS_LLM_BASE_URL", "http://127.0.0.1:11434/v1")
-LLM_MODEL = os.environ.get("JARVIS_LLM_MODEL", "gemma4:26b")
+# gemma4:e4b has ~300ms time-to-first-token vs gemma4:26b's ~1s+ because its
+# weights are 9.6GB vs 17GB. For conversational voice UX the perceived speed
+# dominates the modest quality gap. Override via JARVIS_LLM_MODEL=gemma4:26b
+# for harder reasoning questions.
+LLM_MODEL = os.environ.get("JARVIS_LLM_MODEL", "gemma4:e4b")
 LLM_TEMPERATURE = float(os.environ.get("JARVIS_LLM_TEMPERATURE", "0.7"))
 
 TTS_BASE_URL = os.environ.get("JARVIS_TTS_BASE_URL", "http://127.0.0.1:8000/v1")
@@ -83,10 +87,11 @@ AUDIO_OUT_SR = int(os.environ.get("JARVIS_AUDIO_OUT_SR", "24000"))
 SYSTEM_PROMPT = os.environ.get(
     "JARVIS_SYSTEM_PROMPT",
     (
-        "You are JARVIS, a helpful local voice assistant running on a "
-        "MacBook Pro. Be direct and conversational. Keep replies short "
-        "(one or two sentences) unless the user asks for detail. When "
-        "you don't know something, say so plainly rather than guessing."
+        "You are JARVIS, a local voice assistant running on a MacBook Pro. "
+        "Always reply in ONE or TWO short sentences. No lists, no headers, "
+        "no preamble like 'Sure!' or 'Of course'. Speak like a person, "
+        "not a chatbot. If you don't know something, say so plainly in "
+        "one sentence rather than guessing."
     ),
 )
 

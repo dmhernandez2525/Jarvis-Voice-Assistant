@@ -24,12 +24,13 @@ if ! curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
     exit 1
 fi
 
-for m in gemma4:26b; do
-    if ! ollama list | grep -q "^$m"; then
-        echo "ERROR: model $m is not pulled. Run: ollama pull $m"
-        exit 1
-    fi
-done
+# Default LLM is now gemma4:e4b (faster first-token for voice UX).
+# JARVIS_LLM_MODEL env can override; we preflight whichever is configured.
+LLM_TO_CHECK="${JARVIS_LLM_MODEL:-gemma4:e4b}"
+if ! ollama list | grep -q "^$LLM_TO_CHECK"; then
+    echo "ERROR: model $LLM_TO_CHECK is not pulled. Run: ollama pull $LLM_TO_CHECK"
+    exit 1
+fi
 
 # --- Start mlx_audio.server for TTS ------------------------------------
 
