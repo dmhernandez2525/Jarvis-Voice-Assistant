@@ -94,13 +94,12 @@ TTS_SPEED_STEP = float(os.environ.get("JARVIS_TTS_SPEED_STEP", "0.2"))
 TTS_SPEED_DEFAULT = float(os.environ.get("JARVIS_TTS_SPEED_DEFAULT", "1.0"))
 
 # Silero VAD tuning. Pipecat's defaults are confidence=0.7 and min_volume=0.6,
-# which are calibrated for loud close-mic recordings (podcast/studio). Real
-# laptop mic at normal conversational distance peaks around 0.2-0.4 on the
-# 0-1 amplitude scale, so min_volume=0.6 rejects everything before Silero
-# evaluates it. Lowered defaults calibrated against an actual MacBook Pro
-# mic measurement (peak 0.298, mean 0.013).
+# which are calibrated for loud close-mic recordings. Real laptop mic audio
+# inside Pipecat's pipeline comes through quieter than standalone PyAudio
+# (mean ~0.001 idle, peaks under 0.01 in early probe runs even when Daniel
+# was speaking), so thresholds here are aggressive by design.
 VAD_CONFIDENCE = float(os.environ.get("JARVIS_VAD_CONFIDENCE", "0.5"))
-VAD_MIN_VOLUME = float(os.environ.get("JARVIS_VAD_MIN_VOLUME", "0.05"))
+VAD_MIN_VOLUME = float(os.environ.get("JARVIS_VAD_MIN_VOLUME", "0.005"))
 VAD_START_SECS = float(os.environ.get("JARVIS_VAD_START_SECS", "0.2"))
 VAD_STOP_SECS = float(os.environ.get("JARVIS_VAD_STOP_SECS", "0.5"))
 
@@ -292,32 +291,46 @@ AUDIO_PROBE_ENABLED = os.environ.get("JARVIS_AUDIO_PROBE", "1") not in ("0", "fa
 
 
 class AudioFrameProbe(FrameProcessor):
-    """Diagnostic processor: logs how many InputAudioRawFrames pass through.
+    """Diagnostic processor: tracks audio amplitude across every frame so
+    transient speech peaks can't hide between probe windows.
 
-    Insert FIRST in the pipeline (immediately after transport.input()) so
-    we can tell whether the PyAudio callback is producing frames at all.
-    If the pipeline looks stuck with no VAD events, this will clarify
-    whether the silence is upstream (no audio reaching Python) or downstream
-    (audio reaching us but Silero not triggering).
+    Logs:
+      - One-shot on first frame (format + sample rate)
+      - Periodic window summary: MAX peak and cumulative above-threshold
+        count since last log
+      - Instant trigger on any single frame whose peak exceeds
+        `loud_frame_peak` (default 0.05, tuned below typical speech peaks)
 
-    Logs every AUDIO_PROBE_EVERY frames, plus one-shot on the first frame.
+    Without the per-window max + instant trigger, sampling only the last
+    frame in each window means 99% of probe readings land on inter-word
+    silence and the fact that loud frames DID arrive gets lost.
     """
 
     AUDIO_PROBE_EVERY = int(os.environ.get("JARVIS_AUDIO_PROBE_EVERY", "250"))
+    LOUD_FRAME_PEAK = float(os.environ.get("JARVIS_AUDIO_LOUD_FRAME_PEAK", "0.05"))
 
     def __init__(self):
         super().__init__()
         self._count = 0
         self._first_logged = False
+        # Rolling window stats (reset every log)
+        self._window_max_peak = 0.0
+        self._window_sum_mean = 0.0
+        self._window_loud_frame_count = 0
+        self._instant_log_budget = int(
+            os.environ.get("JARVIS_AUDIO_INSTANT_LOG_BUDGET", "10")
+        )
         logger.info(
-            "AudioFrameProbe armed (logs every %d audio frames, ~5s at 20ms chunks)",
-            self.AUDIO_PROBE_EVERY,
+            "AudioFrameProbe armed (window=%d frames, loud-frame trigger >%.3f peak, "
+            "instant-log budget %d)",
+            self.AUDIO_PROBE_EVERY, self.LOUD_FRAME_PEAK, self._instant_log_budget,
         )
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
         if isinstance(frame, InputAudioRawFrame):
             self._count += 1
+
             if not self._first_logged:
                 self._first_logged = True
                 logger.info(
@@ -330,22 +343,54 @@ class AudioFrameProbe(FrameProcessor):
                     sample_rate=frame.sample_rate,
                     bytes=len(frame.audio),
                 )
-            elif self._count % self.AUDIO_PROBE_EVERY == 0:
-                # Compute peak/mean for the last frame so we know we're
-                # getting real audio, not silence.
-                samples = np.frombuffer(frame.audio, dtype=np.int16).astype(np.float32) / 32768.0
-                mean_abs = float(np.abs(samples).mean())
-                peak = float(np.abs(samples).max())
+
+            samples = np.frombuffer(frame.audio, dtype=np.int16).astype(np.float32) / 32768.0
+            mean_abs = float(np.abs(samples).mean())
+            peak = float(np.abs(samples).max())
+
+            # Update rolling window stats
+            if peak > self._window_max_peak:
+                self._window_max_peak = peak
+            self._window_sum_mean += mean_abs
+            if peak >= self.LOUD_FRAME_PEAK:
+                self._window_loud_frame_count += 1
+
+                # Instant log on loud frames so we can SEE speech arrive
+                # in real time, not averaged away. Rate-limited to avoid
+                # spamming the log.
+                if self._instant_log_budget > 0:
+                    self._instant_log_budget -= 1
+                    logger.info(
+                        "AudioFrameProbe: loud frame #%d at count=%d, peak=%.4f mean=%.4f "
+                        "(instant-log budget %d remaining)",
+                        self._window_loud_frame_count, self._count, peak, mean_abs,
+                        self._instant_log_budget,
+                    )
+                    events.event(
+                        "audio_loud_frame", count=self._count, peak=peak, mean_abs=mean_abs,
+                    )
+
+            # Periodic window summary
+            if self._count % self.AUDIO_PROBE_EVERY == 0:
+                avg_mean = self._window_sum_mean / self.AUDIO_PROBE_EVERY
                 logger.info(
-                    "AudioFrameProbe: %d frames received, last chunk mean=%.4f peak=%.4f",
-                    self._count, mean_abs, peak,
+                    "AudioFrameProbe: %d total frames, window max_peak=%.4f "
+                    "avg_mean=%.4f loud_frames=%d",
+                    self._count, self._window_max_peak, avg_mean,
+                    self._window_loud_frame_count,
                 )
                 events.event(
-                    "audio_probe",
+                    "audio_probe_window",
                     frame_count=self._count,
-                    last_mean_abs=mean_abs,
-                    last_peak=peak,
+                    window_max_peak=self._window_max_peak,
+                    window_avg_mean=avg_mean,
+                    window_loud_frames=self._window_loud_frame_count,
                 )
+                # Reset window
+                self._window_max_peak = 0.0
+                self._window_sum_mean = 0.0
+                self._window_loud_frame_count = 0
+
         await self.push_frame(frame, direction)
 
 
