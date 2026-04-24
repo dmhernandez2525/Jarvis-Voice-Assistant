@@ -34,6 +34,7 @@ import asyncio
 import io
 import os
 import tempfile
+import time
 import wave
 from typing import AsyncGenerator, Optional
 
@@ -103,13 +104,31 @@ class ParakeetMLXSTTService(SegmentedSTTService):
     Receives a raw WAV-bytes payload from SegmentedSTTService after VAD
     signals end-of-speech. Writes to a temp file, runs parakeet_mlx, and
     yields a single TranscriptionFrame.
+
+    If `preloaded_model` is supplied, that model is used directly (for
+    warm-start). Otherwise the model is lazy-loaded on first transcription.
     """
 
-    def __init__(self, *, model_id: str, sample_rate: Optional[int] = None, **kwargs):
+    def __init__(
+        self,
+        *,
+        model_id: str,
+        preloaded_model: Optional[object] = None,
+        sample_rate: Optional[int] = None,
+        **kwargs,
+    ):
         super().__init__(sample_rate=sample_rate, **kwargs)
         self._model_id = model_id
-        self._model = None
-        logger.info("ParakeetMLXSTTService configured: model=%s", model_id)
+        self._model = preloaded_model
+        if preloaded_model is not None:
+            logger.info(
+                "ParakeetMLXSTTService configured with preloaded model: %s",
+                model_id,
+            )
+        else:
+            logger.info(
+                "ParakeetMLXSTTService configured (lazy load): %s", model_id
+            )
 
     def _load_model(self):
         if self._model is not None:
@@ -120,7 +139,7 @@ class ParakeetMLXSTTService(SegmentedSTTService):
         logger.info("Parakeet-MLX ready")
 
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame, None]:
-        # Lazy-load the model on first call so the pipeline can start fast.
+        # Lazy-load only if warm-start didn't happen.
         if self._model is None:
             # Parakeet load is synchronous + ~1s. Run in a thread to avoid
             # stalling the event loop.
@@ -165,6 +184,124 @@ class ParakeetMLXSTTService(SegmentedSTTService):
             yield ErrorFrame(error=f"STT failure: {e}")
 
 
+# --- Warm-start ------------------------------------------------------------
+
+WARMUP_ENABLED = os.environ.get("JARVIS_WARMUP", "1") not in ("0", "false", "False")
+
+
+def _warm_parakeet():
+    """Load Parakeet-MLX weights into memory. Returns the loaded model."""
+    from parakeet_mlx import from_pretrained
+    logger.info("Warm-up: loading Parakeet-MLX (%s)...", STT_MODEL_ID)
+    t0 = time.time()
+    model = from_pretrained(STT_MODEL_ID)
+    ms = int((time.time() - t0) * 1000)
+    logger.info("Warm-up: Parakeet loaded in %dms", ms)
+    events.event("warmup_stt", duration_ms=ms)
+    return model
+
+
+def _warm_ollama():
+    """Send a tiny generate call so Ollama loads the LLM into Metal."""
+    import ollama
+    logger.info("Warm-up: pre-warming Ollama %s (keep_alive=15m)...", LLM_MODEL)
+    t0 = time.time()
+    try:
+        ollama.generate(
+            model=LLM_MODEL,
+            prompt="Hello.",
+            stream=False,
+            keep_alive="15m",
+            options={"num_predict": 1, "temperature": 0.1},
+        )
+    except Exception as e:
+        logger.error("Warm-up: Ollama call failed: %s", e, exc_info=True)
+        events.event("warmup_llm_error", error=str(e))
+        return
+    ms = int((time.time() - t0) * 1000)
+    logger.info("Warm-up: Ollama %s resident in %dms", LLM_MODEL, ms)
+    events.event("warmup_llm", duration_ms=ms, model=LLM_MODEL)
+
+
+def _warm_kokoro():
+    """Generate one tiny Kokoro clip so the voice file is cached and the
+    mlx-audio server has loaded weights into Metal.
+
+    Note: we call the mlx-audio Python API directly rather than hitting the
+    running server, because the server warmup happens on its first request.
+    Using the Python API gets BOTH paths warm in one go.
+    """
+    from mlx_audio.tts.generate import generate_audio
+    logger.info("Warm-up: generating a throwaway Kokoro clip (voice=%s)...", TTS_VOICE)
+    t0 = time.time()
+    tmp_dir = tempfile.mkdtemp(prefix="jarvis-warmup-")
+    prefix = os.path.join(tmp_dir, "warmup")
+    try:
+        generate_audio(
+            text="Ready.",
+            model=TTS_MODEL,
+            voice=TTS_VOICE,
+            file_prefix=prefix,
+            audio_format="wav",
+            lang_code="a",
+            join_audio=True,
+            verbose=False,
+        )
+    except Exception as e:
+        logger.error("Warm-up: Kokoro generate failed: %s", e, exc_info=True)
+        events.event("warmup_tts_error", error=str(e))
+        return
+    finally:
+        # Clean up any produced files.
+        try:
+            for name in os.listdir(tmp_dir):
+                try:
+                    os.unlink(os.path.join(tmp_dir, name))
+                except OSError:
+                    pass
+            os.rmdir(tmp_dir)
+        except OSError:
+            pass
+    ms = int((time.time() - t0) * 1000)
+    logger.info("Warm-up: Kokoro ready in %dms", ms)
+    events.event("warmup_tts", duration_ms=ms, voice=TTS_VOICE)
+
+
+async def warm_start() -> object:
+    """Pre-load all three stages in parallel-on-threads so user's first
+    utterance doesn't eat a 15-20s cold-load penalty.
+
+    Returns the preloaded Parakeet model (or None if warmup disabled).
+    """
+    if not WARMUP_ENABLED:
+        logger.info("Warm-up disabled (JARVIS_WARMUP=0). First query will be slow.")
+        return None
+
+    logger.info("Warm-up: starting (all three stages in parallel)")
+    events.event("warmup_start")
+    t0 = time.time()
+
+    # Run all three warmups concurrently on threads to minimize wall time.
+    results = await asyncio.gather(
+        asyncio.to_thread(_warm_parakeet),
+        asyncio.to_thread(_warm_ollama),
+        asyncio.to_thread(_warm_kokoro),
+        return_exceptions=True,
+    )
+
+    parakeet_result = results[0]
+    for i, r in enumerate(results):
+        if isinstance(r, Exception):
+            name = ("parakeet", "ollama", "kokoro")[i]
+            logger.error("Warm-up: %s raised %s: %s", name, type(r).__name__, r)
+
+    total_ms = int((time.time() - t0) * 1000)
+    logger.info("Warm-up: all stages ready in %dms (wall)", total_ms)
+    events.event("warmup_complete", duration_ms=total_ms)
+
+    return parakeet_result if not isinstance(parakeet_result, Exception) else None
+
+
 # --- Main ------------------------------------------------------------------
 
 async def main() -> None:
@@ -177,7 +314,10 @@ async def main() -> None:
         tts_base_url=TTS_BASE_URL,
         tts_model=TTS_MODEL,
         tts_voice=TTS_VOICE,
+        warmup_enabled=WARMUP_ENABLED,
     )
+
+    preloaded_parakeet = await warm_start()
 
     transport = LocalAudioTransport(
         LocalAudioTransportParams(
@@ -191,6 +331,7 @@ async def main() -> None:
 
     stt = ParakeetMLXSTTService(
         model_id=STT_MODEL_ID,
+        preloaded_model=preloaded_parakeet,
         sample_rate=AUDIO_IN_SR,
     )
 
