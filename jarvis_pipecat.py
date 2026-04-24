@@ -355,7 +355,17 @@ class ParakeetMLXSTTService(SegmentedSTTService):
             try:
                 with os.fdopen(fd, "wb") as f:
                     f.write(audio)
-                result = await asyncio.to_thread(self._model.transcribe, path)
+                # MLX needs a GPU stream bound to the current thread.
+                # When Parakeet was loaded on the main thread (warmup) but
+                # inference runs on an asyncio.to_thread worker, the worker
+                # thread has no default GPU stream, producing
+                # `RuntimeError: There is no Stream(gpu, 0) in current thread.`
+                # Wrap inference in `mx.stream(mx.gpu)` to bind one.
+                def _transcribe_with_stream(p):
+                    import mlx.core as mx
+                    with mx.stream(mx.gpu):
+                        return self._model.transcribe(p)
+                result = await asyncio.to_thread(_transcribe_with_stream, path)
             finally:
                 try:
                     os.unlink(path)
