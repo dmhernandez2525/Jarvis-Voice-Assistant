@@ -42,8 +42,15 @@ import numpy as np
 
 # Pipecat
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import ErrorFrame, Frame, TranscriptionFrame
+from pipecat.frames.frames import (
+    ErrorFrame,
+    Frame,
+    TranscriptionFrame,
+    TTSSpeakFrame,
+    TTSUpdateSettingsFrame,
+)
 from pipecat.pipeline.pipeline import Pipeline
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_response_universal import (
@@ -79,6 +86,10 @@ LLM_TEMPERATURE = float(os.environ.get("JARVIS_LLM_TEMPERATURE", "0.7"))
 TTS_BASE_URL = os.environ.get("JARVIS_TTS_BASE_URL", "http://127.0.0.1:8000/v1")
 TTS_MODEL = os.environ.get("JARVIS_TTS_MODEL", "mlx-community/Kokoro-82M-bf16")
 TTS_VOICE = os.environ.get("JARVIS_TTS_VOICE", "am_michael")
+TTS_SPEED_MIN = float(os.environ.get("JARVIS_TTS_SPEED_MIN", "0.5"))
+TTS_SPEED_MAX = float(os.environ.get("JARVIS_TTS_SPEED_MAX", "2.0"))
+TTS_SPEED_STEP = float(os.environ.get("JARVIS_TTS_SPEED_STEP", "0.2"))
+TTS_SPEED_DEFAULT = float(os.environ.get("JARVIS_TTS_SPEED_DEFAULT", "1.0"))
 
 # Sample rates: Pipecat defaults are 16k in, 24k out for TTS.
 AUDIO_IN_SR = int(os.environ.get("JARVIS_AUDIO_IN_SR", "16000"))
@@ -187,6 +198,157 @@ class ParakeetMLXSTTService(SegmentedSTTService):
             logger.error("Parakeet STT failed: %s", e, exc_info=True)
             events.event("stt_error", error=str(e), exception_type=type(e).__name__)
             yield ErrorFrame(error=f"STT failure: {e}")
+
+
+# --- Voice-controlled speech-rate commands --------------------------------
+
+# Keywords that trigger a speed change. Matched against the transcription
+# after lowercasing + stripping punctuation. Ordered longest-phrase first
+# within each category so "normal speed" is matched before a bare "speed".
+_FASTER_PHRASES = (
+    "speak faster",
+    "talk faster",
+    "speed up",
+    "speed it up",
+    "go faster",
+    "faster please",
+)
+_SLOWER_PHRASES = (
+    "speak slower",
+    "talk slower",
+    "slow down",
+    "slower please",
+    "go slower",
+)
+_RESET_PHRASES = (
+    "normal speed",
+    "reset speed",
+    "default speed",
+    "regular speed",
+    "normal pace",
+)
+
+
+def _classify_speed_command(text: str) -> Optional[str]:
+    """Return 'faster', 'slower', 'reset', or None.
+
+    Strict-ish matching: the command must be the whole transcription or the
+    bulk of it. Prevents "I want to learn to speak faster Spanish" from
+    triggering the speed change.
+    """
+    if not text:
+        return None
+    norm = "".join(c.lower() if c.isalnum() or c == " " else " " for c in text)
+    norm = " ".join(norm.split())  # collapse whitespace
+
+    # Whole-utterance match: the entire transcription IS a speed command.
+    for kind, phrases in (
+        ("faster", _FASTER_PHRASES),
+        ("slower", _SLOWER_PHRASES),
+        ("reset", _RESET_PHRASES),
+    ):
+        for phrase in phrases:
+            if norm == phrase or norm == phrase + " jarvis" or norm == "jarvis " + phrase:
+                return kind
+
+    # Loose match but only if the utterance is short (under 6 words). Long
+    # utterances are probably full sentences using the phrase incidentally.
+    if len(norm.split()) <= 6:
+        for kind, phrases in (
+            ("faster", _FASTER_PHRASES),
+            ("slower", _SLOWER_PHRASES),
+            ("reset", _RESET_PHRASES),
+        ):
+            if any(phrase in norm for phrase in phrases):
+                return kind
+
+    return None
+
+
+class SpeechRateController(FrameProcessor):
+    """Intercepts TranscriptionFrames that are speech-rate commands.
+
+    When the user says "speak faster" / "speak slower" / "normal speed",
+    this processor:
+      1. Computes the new speed (clamped to TTS_SPEED_MIN..TTS_SPEED_MAX)
+      2. Pushes a TTSUpdateSettingsFrame so the TTS service reconfigures
+      3. Pushes a TTSSpeakFrame with the acknowledgment (bypasses the LLM)
+      4. Drops the original TranscriptionFrame so it never reaches the
+         LLM context (speed commands are meta, not conversation)
+
+    All other frames pass through unchanged.
+    """
+
+    def __init__(self, *, initial_speed: float = TTS_SPEED_DEFAULT):
+        super().__init__()
+        self._speed = max(TTS_SPEED_MIN, min(TTS_SPEED_MAX, initial_speed))
+        logger.info(
+            "SpeechRateController ready (speed=%.1fx, step=%.1f, range=%.1f-%.1fx)",
+            self._speed, TTS_SPEED_STEP, TTS_SPEED_MIN, TTS_SPEED_MAX,
+        )
+
+    @property
+    def current_speed(self) -> float:
+        return self._speed
+
+    def _compute_new_speed(self, kind: str) -> tuple[float, str]:
+        """Return (new_speed, ack_text) for the given command kind."""
+        if kind == "reset":
+            new_speed = TTS_SPEED_DEFAULT
+            ack = "Back to normal speed."
+        elif kind == "faster":
+            new_speed = min(TTS_SPEED_MAX, self._speed + TTS_SPEED_STEP)
+            if new_speed == self._speed:
+                ack = f"Already at maximum speed, sir."
+            else:
+                ack = "Speaking faster."
+        else:  # slower
+            new_speed = max(TTS_SPEED_MIN, self._speed - TTS_SPEED_STEP)
+            if new_speed == self._speed:
+                ack = "Already at minimum speed, sir."
+            else:
+                ack = "Speaking slower."
+        return new_speed, ack
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        # Always call super first so FrameProcessor state is updated.
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, TranscriptionFrame):
+            kind = _classify_speed_command(frame.text)
+            if kind is not None:
+                new_speed, ack = self._compute_new_speed(kind)
+                old_speed = self._speed
+                self._speed = new_speed
+
+                logger.info(
+                    "Speech rate command: kind=%s %.1fx -> %.1fx (ack=%r)",
+                    kind, old_speed, new_speed, ack,
+                )
+                events.event(
+                    "speech_rate_change",
+                    kind=kind,
+                    old_speed=old_speed,
+                    new_speed=new_speed,
+                    trigger=frame.text,
+                )
+
+                # 1. Update TTS settings so subsequent speech uses the new speed.
+                await self.push_frame(
+                    TTSUpdateSettingsFrame(settings={"speed": new_speed}),
+                    direction,
+                )
+                # 2. Speak the acknowledgment directly, bypassing the LLM.
+                await self.push_frame(
+                    TTSSpeakFrame(ack, append_to_context=False),
+                    direction,
+                )
+                # 3. Do NOT propagate the original TranscriptionFrame.
+                #    The LLM context should not see the speed command.
+                return
+
+        # Every other frame passes through unchanged.
+        await self.push_frame(frame, direction)
 
 
 # --- Warm-start ------------------------------------------------------------
@@ -351,8 +513,11 @@ async def main() -> None:
         base_url=TTS_BASE_URL,
         model=TTS_MODEL,
         voice=TTS_VOICE,
+        speed=TTS_SPEED_DEFAULT,
         sample_rate=AUDIO_OUT_SR,
     )
+
+    speech_rate = SpeechRateController(initial_speed=TTS_SPEED_DEFAULT)
 
     context = LLMContext(
         messages=[{"role": "system", "content": SYSTEM_PROMPT}],
@@ -362,8 +527,9 @@ async def main() -> None:
     pipeline = Pipeline([
         transport.input(),        # mic
         stt,                      # Parakeet segmented STT
+        speech_rate,              # intercepts speed commands, bypasses LLM
         aggregators.user,         # records user turn into context
-        llm,                      # Gemma 4 26B via Ollama
+        llm,                      # Gemma 4 via Ollama
         tts,                      # Kokoro via mlx_audio.server
         transport.output(),       # speaker
         aggregators.assistant,    # records assistant turn into context
