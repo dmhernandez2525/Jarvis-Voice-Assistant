@@ -71,7 +71,11 @@ from pipecat.transports.local.audio import (
     LocalAudioTransport,
     LocalAudioTransportParams,
 )
-from pipecat.frames.frames import InputAudioRawFrame
+from pipecat.frames.frames import (
+    InputAudioRawFrame,
+    BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
+)
 from pipecat.utils.time import time_now_iso8601
 
 # Ours
@@ -467,6 +471,71 @@ def _classify_speed_command(text: str) -> Optional[str]:
                 return kind
 
     return None
+
+
+# --- Input audio gate (prevents acoustic self-triggering) ------------------
+
+# When the Mac speaker plays Jarvis's TTS, the built-in mic picks it up,
+# Silero VAD flags it as "user speaking," and the interruption system
+# kills Jarvis's own TTS. Symptom: you hear only the first word or two,
+# then silence + Parakeet ends up transcribing the bot's own output.
+#
+# The gate below drops InputAudioRawFrames while the bot is speaking
+# (BotStartedSpeakingFrame..BotStoppedSpeakingFrame window), giving us
+# "half-duplex" mode: you wait for the bot to finish before you can
+# interrupt by voice. Real acoustic echo cancellation (WebRTC AEC3 or
+# similar) would allow true barge-in even from laptop speakers; that's
+# a bigger piece of work.
+#
+# Users on headphones won't have the self-trigger problem; they can set
+# JARVIS_INPUT_GATE=0 to keep true barge-in.
+INPUT_GATE_ENABLED = os.environ.get("JARVIS_INPUT_GATE", "1") not in ("0", "false", "False")
+
+
+class InputAudioGate(FrameProcessor):
+    """Gates InputAudioRawFrame while the bot is mid-TTS.
+
+    Listens for BotStartedSpeakingFrame and BotStoppedSpeakingFrame (which
+    flow upstream from the TTS/output transport). While the bot flag is
+    set, silently drops any InputAudioRawFrame so Silero VAD doesn't see
+    the speaker leak. Other frame types pass through in both directions.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._bot_speaking = False
+        self._dropped_while_speaking = 0
+        logger.info("InputAudioGate armed (half-duplex mode to prevent self-trigger)")
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, BotStartedSpeakingFrame):
+            self._bot_speaking = True
+            self._dropped_while_speaking = 0
+            logger.info("InputAudioGate: muting mic (bot speaking)")
+            events.event("input_gate_closed")
+            await self.push_frame(frame, direction)
+            return
+
+        if isinstance(frame, BotStoppedSpeakingFrame):
+            self._bot_speaking = False
+            logger.info(
+                "InputAudioGate: unmuting mic (bot stopped, dropped %d audio frames)",
+                self._dropped_while_speaking,
+            )
+            events.event(
+                "input_gate_opened", dropped_frames=self._dropped_while_speaking,
+            )
+            await self.push_frame(frame, direction)
+            return
+
+        # Drop audio frames while bot is speaking.
+        if self._bot_speaking and isinstance(frame, InputAudioRawFrame):
+            self._dropped_while_speaking += 1
+            return
+
+        await self.push_frame(frame, direction)
 
 
 # --- Debug probe ----------------------------------------------------------
@@ -883,6 +952,8 @@ async def main() -> None:
     processors = [transport.input()]
     if AUDIO_PROBE_ENABLED:
         processors.append(AudioFrameProbe())
+    if INPUT_GATE_ENABLED:
+        processors.append(InputAudioGate())  # drops mic while bot TTS plays
     processors.extend([
         vad_processor,            # emits VADUserStarted/StoppedSpeakingFrame
         stt,                      # Parakeet segmented STT (consumes VAD events)
