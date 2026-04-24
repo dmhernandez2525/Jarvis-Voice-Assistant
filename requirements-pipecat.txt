@@ -1,0 +1,21 @@
+# Dependencies specific to the Pipecat full-duplex variant (jarvis_pipecat.py).
+#
+# Install with:
+#   source ~/venvs/local-ai/bin/activate
+#   uv pip install -r requirements-pipecat.txt
+#
+# These are installed on top of the core hardened venv (torch>=2.6, transformers>=4.53,
+# mlx>=0.29.4, pillow>=11.3 + mlx-audio + parakeet-mlx + ollama per the
+# local-ai-stack HARDENED_INSTALL_PLAN.md).
+#
+# Pins follow audit 05-Pipecat-Scenario-C-Audit.md where applicable. Version
+# ranges instead of exact pins because Pipecat's rev cadence is weekly and the
+# wider ecosystem is changing fast; re-audit with `uv pip list` periodically.
+
+# Pipecat orchestrator + the three extras we actually use.
+pipecat-ai[silero,openai,local,webrtc]>=1.0,<2.0
+
+# webrtcvad is a required dep of mlx_audio.server but its pyproject.toml
+# doesn't declare it. Without this the server dies at import time with
+# ModuleNotFoundError: No module named 'webrtcvad'.
+webrtcvad>=2.0.10

@@ -16,6 +16,26 @@ fi
 
 source "$VENV/bin/activate"
 
+# --- Preflight: Python deps --------------------------------------------
+
+# webrtcvad is a silent requirement of mlx_audio.server that its own
+# pyproject.toml fails to declare. Fail fast with a clear install command
+# rather than a cryptic stack trace 3 steps deeper.
+if ! python -c "import webrtcvad" 2>/dev/null; then
+    echo "ERROR: missing Python dependency: webrtcvad"
+    echo "Install:  uv pip install -r requirements-pipecat.txt"
+    echo "     or:  uv pip install webrtcvad"
+    exit 1
+fi
+
+for mod in pipecat parakeet_mlx mlx_audio ollama; do
+    if ! python -c "import $mod" 2>/dev/null; then
+        echo "ERROR: missing Python dependency: $mod"
+        echo "Install:  uv pip install -r requirements-pipecat.txt"
+        exit 1
+    fi
+done
+
 # --- Preflight: Ollama --------------------------------------------------
 
 if ! curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
