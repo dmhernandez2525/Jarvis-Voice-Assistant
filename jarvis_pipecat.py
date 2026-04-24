@@ -60,8 +60,13 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
 )
 from pipecat.services.openai.llm import OpenAILLMService
-from pipecat.services.openai.tts import OpenAITTSService
+from pipecat.services.tts_service import TTSService
 from pipecat.services.stt_service import SegmentedSTTService
+from pipecat.frames.frames import (
+    TTSAudioRawFrame,
+    TTSStartedFrame,
+    TTSStoppedFrame,
+)
 from pipecat.transports.local.audio import (
     LocalAudioTransport,
     LocalAudioTransportParams,
@@ -122,6 +127,166 @@ SYSTEM_PROMPT = os.environ.get(
 # --- Logging ---------------------------------------------------------------
 
 logger, events, SESSION_ID, SESSION_START = setup_logging(name="jarvis.pipecat")
+
+
+# --- Kokoro TTS service (direct HTTP, no OpenAI SDK validation) -----------
+
+class KokoroTTSService(TTSService):
+    """Custom TTS service that hits mlx_audio.server's OpenAI-compatible
+    endpoint directly via httpx, bypassing the official openai SDK's
+    client-side voice-name enum.
+
+    Pipecat's OpenAITTSService validates voice names against VALID_VOICES
+    (alloy, echo, fable, onyx, nova, shimmer) on the client before sending
+    the request, which immediately KeyErrors on Kokoro voice ids like
+    am_michael / af_heart. mlx-audio's server accepts any voice the
+    underlying Kokoro model supports.
+
+    Streams PCM16 audio back via TTSAudioRawFrame. TTSUpdateSettingsFrame
+    (emitted by SpeechRateController) is handled by the base class; we
+    re-read self._speed on every run_tts call.
+    """
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        model: str,
+        voice: str,
+        speed: float = 1.0,
+        sample_rate: int = 24000,
+        request_timeout_s: float = 30.0,
+        **kwargs,
+    ):
+        # TTSService expects a settings object for compatibility with the
+        # settings-validator; we pass minimal fields.
+        from pipecat.services.settings import TTSSettings
+        tts_settings = TTSSettings(
+            model=model,
+            voice=voice,
+            language=None,
+        )
+        super().__init__(sample_rate=sample_rate, settings=tts_settings, **kwargs)
+        self._base_url = base_url.rstrip("/")
+        self._model = model
+        self._voice = voice
+        self._speed = speed
+        self._sample_rate = sample_rate
+        self._request_timeout_s = request_timeout_s
+        self._client = None  # lazily constructed
+        logger.info(
+            "KokoroTTSService configured: base_url=%s voice=%s model=%s speed=%.1f",
+            self._base_url, self._voice, self._model, self._speed,
+        )
+
+    async def _get_client(self):
+        if self._client is None:
+            import httpx
+            self._client = httpx.AsyncClient(
+                base_url=self._base_url, timeout=self._request_timeout_s,
+            )
+        return self._client
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        """Intercept TTSUpdateSettingsFrame so SpeechRateController commands
+        actually land on our in-memory speed/voice without needing the base
+        TTSService's Settings-object plumbing (which doesn't know about the
+        provider-specific `speed` field on TTSSettings).
+        """
+        # Update our fields FIRST (before super), then let the base class
+        # handle the frame as it sees fit for its own internal state.
+        if isinstance(frame, TTSUpdateSettingsFrame):
+            # Pipecat 1.0's TTSUpdateSettingsFrame can carry either a dict
+            # (legacy) or a delta Settings object. SpeechRateController uses
+            # the dict form: settings={"speed": N} or {"voice": "am_adam"}.
+            extracted = {}
+            if frame.settings:
+                extracted.update(dict(frame.settings))
+            if frame.delta is not None:
+                delta_dict = getattr(frame.delta, "model_dump", lambda: {})()
+                for k, v in delta_dict.items():
+                    if v is not None:
+                        extracted[k] = v
+            if "speed" in extracted:
+                self._speed = float(extracted["speed"])
+                logger.info("KokoroTTSService: speed updated to %.2fx", self._speed)
+                events.event("tts_speed_changed", new_speed=self._speed)
+            if "voice" in extracted:
+                self._voice = str(extracted["voice"])
+                logger.info("KokoroTTSService: voice updated to %s", self._voice)
+                events.event("tts_voice_changed", new_voice=self._voice)
+
+        await super().process_frame(frame, direction)
+
+    async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
+        """POST to mlx_audio.server /v1/audio/speech, stream PCM audio back."""
+        logger.debug("KokoroTTSService: generating [%s]", text[:80])
+        yield TTSStartedFrame()
+        await self.start_processing_metrics()
+        try:
+            client = await self._get_client()
+            payload = {
+                "input": text,
+                "model": self._model,
+                "voice": self._voice,
+                "response_format": "pcm",
+                "speed": self._speed,
+            }
+            t0 = time.time()
+            async with client.stream(
+                "POST", "/v1/audio/speech", json=payload,
+            ) as r:
+                if r.status_code != 200:
+                    body = await r.aread()
+                    err_text = body.decode("utf-8", errors="replace")[:500]
+                    logger.error(
+                        "KokoroTTSService: upstream %d: %s", r.status_code, err_text,
+                    )
+                    events.event(
+                        "tts_upstream_error", status=r.status_code, body=err_text[:200],
+                    )
+                    yield ErrorFrame(
+                        error=f"mlx_audio.server returned {r.status_code}: {err_text}",
+                    )
+                    return
+
+                first_chunk_ms = None
+                total_bytes = 0
+                async for chunk in r.aiter_bytes(chunk_size=4096):
+                    if not chunk:
+                        continue
+                    if first_chunk_ms is None:
+                        first_chunk_ms = int((time.time() - t0) * 1000)
+                    total_bytes += len(chunk)
+                    # mlx-audio returns raw PCM16 at the model's sample rate.
+                    # PCM response_format is signed-16bit little-endian mono.
+                    yield TTSAudioRawFrame(
+                        audio=chunk,
+                        sample_rate=self._sample_rate,
+                        num_channels=1,
+                        context_id=context_id,
+                    )
+
+                total_ms = int((time.time() - t0) * 1000)
+                logger.info(
+                    "KokoroTTSService: %d bytes streamed in %dms (first chunk %dms)",
+                    total_bytes, total_ms, first_chunk_ms or -1,
+                )
+                events.event(
+                    "tts_streamed",
+                    bytes=total_bytes,
+                    total_ms=total_ms,
+                    first_chunk_ms=first_chunk_ms,
+                    speed=self._speed,
+                    voice=self._voice,
+                )
+        except Exception as e:
+            logger.error("KokoroTTSService: unexpected error: %s", e, exc_info=True)
+            events.event("tts_error", error=str(e), exception_type=type(e).__name__)
+            yield ErrorFrame(error=f"KokoroTTSService failure: {e}")
+        finally:
+            await self.stop_processing_metrics()
+            yield TTSStoppedFrame()
 
 
 # --- Parakeet-MLX STT service ---------------------------------------------
@@ -665,15 +830,14 @@ async def main() -> None:
         settings=OpenAILLMService.Settings(model=LLM_MODEL),
     )
 
-    tts = OpenAITTSService(
-        api_key="mlx-audio-local-unused",
+    # Custom TTS service bypassing the openai SDK's voice-name enum
+    # validation (which rejects Kokoro voice ids like am_michael).
+    tts = KokoroTTSService(
         base_url=TTS_BASE_URL,
+        model=TTS_MODEL,
+        voice=TTS_VOICE,
+        speed=TTS_SPEED_DEFAULT,
         sample_rate=AUDIO_OUT_SR,
-        settings=OpenAITTSService.Settings(
-            model=TTS_MODEL,
-            voice=TTS_VOICE,
-            speed=TTS_SPEED_DEFAULT,
-        ),
     )
 
     speech_rate = SpeechRateController(initial_speed=TTS_SPEED_DEFAULT)
