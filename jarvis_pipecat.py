@@ -295,12 +295,12 @@ class ParakeetMLXSTTService(SegmentedSTTService):
     """SegmentedSTTService that transcribes complete speech segments
     using Parakeet-MLX.
 
-    Receives a raw WAV-bytes payload from SegmentedSTTService after VAD
-    signals end-of-speech. Writes to a temp file, runs parakeet_mlx, and
-    yields a single TranscriptionFrame.
-
-    If `preloaded_model` is supplied, that model is used directly (for
-    warm-start). Otherwise the model is lazy-loaded on first transcription.
+    MLX has per-thread GPU default streams. A model loaded on thread A
+    cannot be evaluated on thread B (`RuntimeError: There is no
+    Stream(gpu, 0) in current thread.`). To satisfy this requirement
+    without blocking the asyncio event loop, ALL model work (load +
+    inference) runs on a single dedicated worker thread, exposed via a
+    ThreadPoolExecutor(max_workers=1).
     """
 
     def __init__(
@@ -311,9 +311,6 @@ class ParakeetMLXSTTService(SegmentedSTTService):
         sample_rate: Optional[int] = None,
         **kwargs,
     ):
-        # Populate STTSettings fields so Pipecat's settings validator doesn't
-        # warn about NOT_GIVEN. Parakeet doesn't use these at runtime but the
-        # base class expects them initialized.
         from pipecat.services.stt_service import STTSettings
         stt_settings = kwargs.pop("settings", None) or STTSettings(
             model=model_id,
@@ -321,51 +318,59 @@ class ParakeetMLXSTTService(SegmentedSTTService):
         )
         super().__init__(sample_rate=sample_rate, settings=stt_settings, **kwargs)
         self._model_id = model_id
-        self._model = preloaded_model
+        self._model = None  # always loaded lazily on the dedicated thread
+
+        from concurrent.futures import ThreadPoolExecutor
+        # Single-thread executor. Every Parakeet op (load + transcribe) runs
+        # on this one thread, so MLX stream state stays consistent.
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="jarvis-parakeet"
+        )
+
+        # If a preloaded model was passed in (from warm_start), we can't
+        # actually use it directly because it was created on a different
+        # thread. Instead, schedule a re-load on our dedicated thread.
+        # This adds ~1s of latency on first transcription but is the only
+        # way to keep MLX happy.
         if preloaded_model is not None:
             logger.info(
-                "ParakeetMLXSTTService configured with preloaded model: %s",
-                model_id,
+                "ParakeetMLXSTTService: ignoring preloaded model (loaded on "
+                "wrong thread for MLX); will re-load on dedicated worker."
             )
-        else:
-            logger.info(
-                "ParakeetMLXSTTService configured (lazy load): %s", model_id
-            )
+        logger.info(
+            "ParakeetMLXSTTService configured with dedicated worker thread: %s",
+            model_id,
+        )
 
-    def _load_model(self):
+    def _ensure_model_loaded(self):
+        """Called on the dedicated worker thread. Idempotent."""
         if self._model is not None:
             return
         from parakeet_mlx import from_pretrained
-        logger.info("Loading Parakeet-MLX weights...")
+        logger.info("Loading Parakeet-MLX weights on dedicated worker thread...")
         self._model = from_pretrained(self._model_id)
-        logger.info("Parakeet-MLX ready")
+        logger.info("Parakeet-MLX ready (dedicated worker)")
+
+    def _transcribe_sync(self, wav_path: str):
+        """Runs on the dedicated worker thread. Loads model if needed."""
+        self._ensure_model_loaded()
+        return self._model.transcribe(wav_path)
 
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame, None]:
-        # Lazy-load only if warm-start didn't happen.
-        if self._model is None:
-            # Parakeet load is synchronous + ~1s. Run in a thread to avoid
-            # stalling the event loop.
-            await asyncio.to_thread(self._load_model)
-
         try:
             await self.start_processing_metrics()
 
-            # parakeet-mlx takes a file path; write the WAV bytes out.
             fd, path = tempfile.mkstemp(suffix=".wav", prefix="jarvis-stt-")
             try:
                 with os.fdopen(fd, "wb") as f:
                     f.write(audio)
-                # MLX needs a GPU stream bound to the current thread.
-                # When Parakeet was loaded on the main thread (warmup) but
-                # inference runs on an asyncio.to_thread worker, the worker
-                # thread has no default GPU stream, producing
-                # `RuntimeError: There is no Stream(gpu, 0) in current thread.`
-                # Wrap inference in `mx.stream(mx.gpu)` to bind one.
-                def _transcribe_with_stream(p):
-                    import mlx.core as mx
-                    with mx.stream(mx.gpu):
-                        return self._model.transcribe(p)
-                result = await asyncio.to_thread(_transcribe_with_stream, path)
+                loop = asyncio.get_running_loop()
+                # run_in_executor dispatches to our single-thread pool, so
+                # the first call loads the model AND all subsequent calls
+                # reuse the same MLX-initialized thread.
+                result = await loop.run_in_executor(
+                    self._executor, self._transcribe_sync, path,
+                )
             finally:
                 try:
                     os.unlink(path)
@@ -662,15 +667,27 @@ WARMUP_ENABLED = os.environ.get("JARVIS_WARMUP", "1") not in ("0", "false", "Fal
 
 
 def _warm_parakeet():
-    """Load Parakeet-MLX weights into memory. Returns the loaded model."""
-    from parakeet_mlx import from_pretrained
-    logger.info("Warm-up: loading Parakeet-MLX (%s)...", STT_MODEL_ID)
+    """Pre-download Parakeet-MLX weights (does NOT keep the model, because
+    MLX requires model+inference on the same thread). The real model load
+    happens on the dedicated STT worker thread on first transcription.
+    This just ensures the HF cache is populated so that first load is fast.
+    """
+    logger.info("Warm-up: pre-fetching Parakeet-MLX weight cache...")
     t0 = time.time()
-    model = from_pretrained(STT_MODEL_ID)
+    try:
+        # Instantiating from_pretrained forces the download; the returned
+        # model object will be discarded (garbage collected) so only the
+        # on-disk HF cache benefits. If the cache is already populated this
+        # is fast.
+        from parakeet_mlx import from_pretrained
+        _throwaway = from_pretrained(STT_MODEL_ID)
+        del _throwaway
+    except Exception as e:
+        logger.warning("Warm-up: Parakeet pre-fetch failed (will lazy-load): %s", e)
     ms = int((time.time() - t0) * 1000)
-    logger.info("Warm-up: Parakeet loaded in %dms", ms)
+    logger.info("Warm-up: Parakeet cache primed in %dms", ms)
     events.event("warmup_stt", duration_ms=ms)
-    return model
+    return None  # Model itself is reloaded on the STT worker thread.
 
 
 def _warm_ollama():
