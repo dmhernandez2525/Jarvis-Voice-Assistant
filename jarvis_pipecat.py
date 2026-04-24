@@ -133,7 +133,15 @@ class ParakeetMLXSTTService(SegmentedSTTService):
         sample_rate: Optional[int] = None,
         **kwargs,
     ):
-        super().__init__(sample_rate=sample_rate, **kwargs)
+        # Populate STTSettings fields so Pipecat's settings validator doesn't
+        # warn about NOT_GIVEN. Parakeet doesn't use these at runtime but the
+        # base class expects them initialized.
+        from pipecat.services.stt_service import STTSettings
+        stt_settings = kwargs.pop("settings", None) or STTSettings(
+            model=model_id,
+            language=None,
+        )
+        super().__init__(sample_rate=sample_rate, settings=stt_settings, **kwargs)
         self._model_id = model_id
         self._model = preloaded_model
         if preloaded_model is not None:
