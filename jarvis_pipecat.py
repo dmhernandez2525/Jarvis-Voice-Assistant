@@ -43,6 +43,7 @@ import numpy as np
 # Pipecat
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
+from pipecat.processors.audio.vad_processor import VADProcessor
 from pipecat.frames.frames import (
     ErrorFrame,
     Frame,
@@ -626,6 +627,12 @@ async def main() -> None:
         VAD_CONFIDENCE, VAD_MIN_VOLUME, VAD_START_SECS, VAD_STOP_SECS,
     )
 
+    # Note: Pipecat 1.0 accepts `vad_analyzer=` on LocalAudioTransportParams
+    # but LocalAudioInputTransport's audio task handler doesn't actually call
+    # it (verified by grepping pipecat.transports.base_input — zero refs to
+    # vad_analyzer in the handler). We wire VAD explicitly via VADProcessor
+    # in the pipeline below. The param is passed here for forward-compat if
+    # Pipecat later starts honoring it, but is functionally vestigial today.
     transport = LocalAudioTransport(
         LocalAudioTransportParams(
             audio_in_enabled=True,
@@ -635,6 +642,16 @@ async def main() -> None:
             vad_analyzer=SileroVADAnalyzer(params=vad_params),
         )
     )
+
+    # THE critical piece: VADProcessor consumes InputAudioRawFrame and emits
+    # VADUserStartedSpeakingFrame / VADUserStoppedSpeakingFrame, which the
+    # downstream SegmentedSTTService (Parakeet) subscribes to. Without this
+    # processor in the pipeline, no VAD events ever fire and Parakeet never
+    # runs a transcription.
+    vad_processor = VADProcessor(
+        vad_analyzer=SileroVADAnalyzer(params=vad_params),
+    )
+    logger.info("VADProcessor wired into pipeline")
 
     stt = ParakeetMLXSTTService(
         model_id=STT_MODEL_ID,
@@ -673,7 +690,8 @@ async def main() -> None:
     if AUDIO_PROBE_ENABLED:
         processors.append(AudioFrameProbe())
     processors.extend([
-        stt,                      # Parakeet segmented STT
+        vad_processor,            # emits VADUserStarted/StoppedSpeakingFrame
+        stt,                      # Parakeet segmented STT (consumes VAD events)
         speech_rate,              # intercepts speed commands, bypasses LLM
         aggregators.user(),       # records user turn into context
         llm,                      # Gemma 4 via Ollama
