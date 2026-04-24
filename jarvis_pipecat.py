@@ -42,6 +42,7 @@ import numpy as np
 
 # Pipecat
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
     ErrorFrame,
     Frame,
@@ -90,6 +91,17 @@ TTS_SPEED_MIN = float(os.environ.get("JARVIS_TTS_SPEED_MIN", "0.5"))
 TTS_SPEED_MAX = float(os.environ.get("JARVIS_TTS_SPEED_MAX", "2.0"))
 TTS_SPEED_STEP = float(os.environ.get("JARVIS_TTS_SPEED_STEP", "0.2"))
 TTS_SPEED_DEFAULT = float(os.environ.get("JARVIS_TTS_SPEED_DEFAULT", "1.0"))
+
+# Silero VAD tuning. Pipecat's defaults are confidence=0.7 and min_volume=0.6,
+# which are calibrated for loud close-mic recordings (podcast/studio). Real
+# laptop mic at normal conversational distance peaks around 0.2-0.4 on the
+# 0-1 amplitude scale, so min_volume=0.6 rejects everything before Silero
+# evaluates it. Lowered defaults calibrated against an actual MacBook Pro
+# mic measurement (peak 0.298, mean 0.013).
+VAD_CONFIDENCE = float(os.environ.get("JARVIS_VAD_CONFIDENCE", "0.5"))
+VAD_MIN_VOLUME = float(os.environ.get("JARVIS_VAD_MIN_VOLUME", "0.05"))
+VAD_START_SECS = float(os.environ.get("JARVIS_VAD_START_SECS", "0.2"))
+VAD_STOP_SECS = float(os.environ.get("JARVIS_VAD_STOP_SECS", "0.5"))
 
 # Sample rates: Pipecat defaults are 16k in, 24k out for TTS.
 AUDIO_IN_SR = int(os.environ.get("JARVIS_AUDIO_IN_SR", "16000"))
@@ -494,13 +506,24 @@ async def main() -> None:
 
     preloaded_parakeet = await warm_start()
 
+    vad_params = VADParams(
+        confidence=VAD_CONFIDENCE,
+        start_secs=VAD_START_SECS,
+        stop_secs=VAD_STOP_SECS,
+        min_volume=VAD_MIN_VOLUME,
+    )
+    logger.info(
+        "VAD tuning: confidence=%.2f min_volume=%.2f start_secs=%.2f stop_secs=%.2f",
+        VAD_CONFIDENCE, VAD_MIN_VOLUME, VAD_START_SECS, VAD_STOP_SECS,
+    )
+
     transport = LocalAudioTransport(
         LocalAudioTransportParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
             audio_in_sample_rate=AUDIO_IN_SR,
             audio_out_sample_rate=AUDIO_OUT_SR,
-            vad_analyzer=SileroVADAnalyzer(),
+            vad_analyzer=SileroVADAnalyzer(params=vad_params),
         )
     )
 
