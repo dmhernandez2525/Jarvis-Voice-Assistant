@@ -505,16 +505,18 @@ async def main() -> None:
     llm = OpenAILLMService(
         api_key="ollama-local-unused",  # Ollama ignores the key on loopback.
         base_url=LLM_BASE_URL,
-        model=LLM_MODEL,
+        settings=OpenAILLMService.Settings(model=LLM_MODEL),
     )
 
     tts = OpenAITTSService(
         api_key="mlx-audio-local-unused",
         base_url=TTS_BASE_URL,
-        model=TTS_MODEL,
-        voice=TTS_VOICE,
-        speed=TTS_SPEED_DEFAULT,
         sample_rate=AUDIO_OUT_SR,
+        settings=OpenAITTSService.Settings(
+            model=TTS_MODEL,
+            voice=TTS_VOICE,
+            speed=TTS_SPEED_DEFAULT,
+        ),
     )
 
     speech_rate = SpeechRateController(initial_speed=TTS_SPEED_DEFAULT)
@@ -524,15 +526,18 @@ async def main() -> None:
     )
     aggregators = LLMContextAggregatorPair(context)
 
+    # Important: aggregators.user and aggregators.assistant are METHODS in
+    # Pipecat 1.0 (not attributes). Call them to obtain the actual frame
+    # processor instances.
     pipeline = Pipeline([
         transport.input(),        # mic
         stt,                      # Parakeet segmented STT
         speech_rate,              # intercepts speed commands, bypasses LLM
-        aggregators.user,         # records user turn into context
+        aggregators.user(),       # records user turn into context
         llm,                      # Gemma 4 via Ollama
         tts,                      # Kokoro via mlx_audio.server
         transport.output(),       # speaker
-        aggregators.assistant,    # records assistant turn into context
+        aggregators.assistant(),  # records assistant turn into context
     ])
 
     task = PipelineTask(
