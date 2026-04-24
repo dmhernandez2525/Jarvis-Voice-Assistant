@@ -65,6 +65,7 @@ from pipecat.transports.local.audio import (
     LocalAudioTransport,
     LocalAudioTransportParams,
 )
+from pipecat.frames.frames import InputAudioRawFrame
 from pipecat.utils.time import time_now_iso8601
 
 # Ours
@@ -283,6 +284,69 @@ def _classify_speed_command(text: str) -> Optional[str]:
                 return kind
 
     return None
+
+
+# --- Debug probe ----------------------------------------------------------
+
+AUDIO_PROBE_ENABLED = os.environ.get("JARVIS_AUDIO_PROBE", "1") not in ("0", "false", "False")
+
+
+class AudioFrameProbe(FrameProcessor):
+    """Diagnostic processor: logs how many InputAudioRawFrames pass through.
+
+    Insert FIRST in the pipeline (immediately after transport.input()) so
+    we can tell whether the PyAudio callback is producing frames at all.
+    If the pipeline looks stuck with no VAD events, this will clarify
+    whether the silence is upstream (no audio reaching Python) or downstream
+    (audio reaching us but Silero not triggering).
+
+    Logs every AUDIO_PROBE_EVERY frames, plus one-shot on the first frame.
+    """
+
+    AUDIO_PROBE_EVERY = int(os.environ.get("JARVIS_AUDIO_PROBE_EVERY", "250"))
+
+    def __init__(self):
+        super().__init__()
+        self._count = 0
+        self._first_logged = False
+        logger.info(
+            "AudioFrameProbe armed (logs every %d audio frames, ~5s at 20ms chunks)",
+            self.AUDIO_PROBE_EVERY,
+        )
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, InputAudioRawFrame):
+            self._count += 1
+            if not self._first_logged:
+                self._first_logged = True
+                logger.info(
+                    "AudioFrameProbe: FIRST audio frame received "
+                    "(sample_rate=%d, bytes=%d, channels=%d)",
+                    frame.sample_rate, len(frame.audio), frame.num_channels,
+                )
+                events.event(
+                    "audio_first_frame",
+                    sample_rate=frame.sample_rate,
+                    bytes=len(frame.audio),
+                )
+            elif self._count % self.AUDIO_PROBE_EVERY == 0:
+                # Compute peak/mean for the last frame so we know we're
+                # getting real audio, not silence.
+                samples = np.frombuffer(frame.audio, dtype=np.int16).astype(np.float32) / 32768.0
+                mean_abs = float(np.abs(samples).mean())
+                peak = float(np.abs(samples).max())
+                logger.info(
+                    "AudioFrameProbe: %d frames received, last chunk mean=%.4f peak=%.4f",
+                    self._count, mean_abs, peak,
+                )
+                events.event(
+                    "audio_probe",
+                    frame_count=self._count,
+                    last_mean_abs=mean_abs,
+                    last_peak=peak,
+                )
+        await self.push_frame(frame, direction)
 
 
 class SpeechRateController(FrameProcessor):
@@ -560,8 +624,10 @@ async def main() -> None:
     # Important: aggregators.user and aggregators.assistant are METHODS in
     # Pipecat 1.0 (not attributes). Call them to obtain the actual frame
     # processor instances.
-    pipeline = Pipeline([
-        transport.input(),        # mic
+    processors = [transport.input()]
+    if AUDIO_PROBE_ENABLED:
+        processors.append(AudioFrameProbe())
+    processors.extend([
         stt,                      # Parakeet segmented STT
         speech_rate,              # intercepts speed commands, bypasses LLM
         aggregators.user(),       # records user turn into context
@@ -570,6 +636,7 @@ async def main() -> None:
         transport.output(),       # speaker
         aggregators.assistant(),  # records assistant turn into context
     ])
+    pipeline = Pipeline(processors)
 
     task = PipelineTask(
         pipeline,
