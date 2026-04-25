@@ -94,6 +94,17 @@ LLM_BASE_URL = os.environ.get("JARVIS_LLM_BASE_URL", "http://127.0.0.1:11434/v1"
 # for harder reasoning questions.
 LLM_MODEL = os.environ.get("JARVIS_LLM_MODEL", "gemma4:e4b")
 LLM_TEMPERATURE = float(os.environ.get("JARVIS_LLM_TEMPERATURE", "0.7"))
+# Cap reply length so voice replies are short. Empirically Gemma 4 stays
+# under 60 tokens for one-sentence answers; 120 leaves headroom for
+# two-sentence replies without runaway.
+LLM_MAX_TOKENS = int(os.environ.get("JARVIS_LLM_MAX_TOKENS", "120"))
+# Gemma 4 has thinking-mode capability. With thinking ON (Ollama default)
+# the model burns 200+ hidden tokens of internal reasoning before each
+# answer, taking 5-23s for a one-sentence reply that would otherwise be
+# 0.5s. Setting reasoning_effort=none on the Ollama /v1 OpenAI-compat
+# shim disables thinking. Verified 2026-04-24: same prompt, same model,
+# reasoning_effort=none = 0.53s vs default = 9.51s (18x faster).
+LLM_REASONING_EFFORT = os.environ.get("JARVIS_LLM_REASONING_EFFORT", "none")
 
 TTS_BASE_URL = os.environ.get("JARVIS_TTS_BASE_URL", "http://127.0.0.1:8000/v1")
 TTS_MODEL = os.environ.get("JARVIS_TTS_MODEL", "mlx-community/Kokoro-82M-bf16")
@@ -111,7 +122,7 @@ TTS_SPEED_DEFAULT = float(os.environ.get("JARVIS_TTS_SPEED_DEFAULT", "1.0"))
 VAD_CONFIDENCE = float(os.environ.get("JARVIS_VAD_CONFIDENCE", "0.5"))
 VAD_MIN_VOLUME = float(os.environ.get("JARVIS_VAD_MIN_VOLUME", "0.005"))
 VAD_START_SECS = float(os.environ.get("JARVIS_VAD_START_SECS", "0.2"))
-VAD_STOP_SECS = float(os.environ.get("JARVIS_VAD_STOP_SECS", "0.5"))
+VAD_STOP_SECS = float(os.environ.get("JARVIS_VAD_STOP_SECS", "0.3"))
 
 # Sample rates: Pipecat defaults are 16k in, 24k out for TTS.
 AUDIO_IN_SR = int(os.environ.get("JARVIS_AUDIO_IN_SR", "16000"))
@@ -923,10 +934,25 @@ async def main() -> None:
         sample_rate=AUDIO_IN_SR,
     )
 
+    # Critical for voice UX:
+    #   max_tokens caps reply length (model honors the system prompt's
+    #     "one or two sentences" but adds a safety net here)
+    #   extra.reasoning_effort=none disables Gemma 4's thinking mode
+    #     (verified 18x faster on one-sentence replies, see audit log)
+    llm_extra = {"reasoning_effort": LLM_REASONING_EFFORT}
+    logger.info(
+        "LLM: model=%s max_tokens=%d reasoning_effort=%s temperature=%.2f",
+        LLM_MODEL, LLM_MAX_TOKENS, LLM_REASONING_EFFORT, LLM_TEMPERATURE,
+    )
     llm = OpenAILLMService(
         api_key="ollama-local-unused",  # Ollama ignores the key on loopback.
         base_url=LLM_BASE_URL,
-        settings=OpenAILLMService.Settings(model=LLM_MODEL),
+        settings=OpenAILLMService.Settings(
+            model=LLM_MODEL,
+            max_tokens=LLM_MAX_TOKENS,
+            temperature=LLM_TEMPERATURE,
+            extra=llm_extra,
+        ),
     )
 
     # Custom TTS service bypassing the openai SDK's voice-name enum
