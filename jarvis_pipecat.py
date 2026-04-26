@@ -421,66 +421,85 @@ class ParakeetMLXSTTService(SegmentedSTTService):
 
 # --- Voice-controlled speech-rate commands --------------------------------
 
-# Keywords that trigger a speed change. Matched against the transcription
-# after lowercasing + stripping punctuation. Ordered longest-phrase first
-# within each category so "normal speed" is matched before a bare "speed".
-_FASTER_PHRASES = (
-    "speak faster",
-    "talk faster",
-    "speed up",
-    "speed it up",
-    "go faster",
-    "faster please",
-)
-_SLOWER_PHRASES = (
-    "speak slower",
-    "talk slower",
-    "slow down",
-    "slower please",
-    "go slower",
-)
-_RESET_PHRASES = (
-    "normal speed",
-    "reset speed",
-    "default speed",
-    "regular speed",
-    "normal pace",
-)
+import re
+
+# Speed-change intent matching. People phrase these many ways; matching only
+# literal "speak faster" was too strict (real-world test 2026-04-26 caught
+# "Can you increase the speed of your talking?" / "Let's see what the
+# fastest that you can go is" / "increase the speaking speed" — none of
+# which fired the controller, so the LLM fielded them and made up answers).
+#
+# Approach: regex patterns over a normalized (lowercase, alnum+space)
+# transcript. Patterns are intentionally generous because the cost of a
+# false positive (TTS speed changes when user didn't ask) is small,
+# while the cost of a false negative (user keeps repeating themselves
+# while the LLM fabricates) is the bug we just hit.
+
+# FASTER intent: any pattern that asks for more speed.
+_FASTER_PATTERNS = [
+    re.compile(r"\b(speak|talk|go|reply|respond)\w*\s+(faster|quicker|quickly)\b"),
+    re.compile(r"\bspeed\s+(it\s+)?up\b"),
+    re.compile(r"\b(increase|raise|bump|crank)\s+(up\s+)?(your\s+|the\s+)?(speaking\s+)?(speed|pace|rate|tempo)\b"),
+    re.compile(r"\b(your\s+)?(speaking|talking)\s+speed\s+(up|higher|faster)\b"),
+    re.compile(r"\b(faster|quicker|quickly)\s+(please|now|jarvis)\b"),
+    re.compile(r"\b(make|let)\s+\w+\s+(faster|quicker)\b"),
+    re.compile(r"\b(fastest|max(imum)?)\s+(speed|pace|rate)\b"),
+    re.compile(r"\bfastest\s+(you|jarvis|that)\b"),
+    re.compile(r"\b(speak|talk)\s+more\s+(quickly|fast)\b"),
+    re.compile(r"^\s*faster\.?\s*$"),
+]
+
+# SLOWER intent.
+_SLOWER_PATTERNS = [
+    re.compile(r"\b(speak|talk|go|reply|respond)\w*\s+(slower|slowly)\b"),
+    re.compile(r"\bslow\s+(it\s+)?down\b"),
+    re.compile(r"\b(decrease|lower|reduce|drop)\s+(down\s+)?(your\s+|the\s+)?(speaking\s+)?(speed|pace|rate|tempo)\b"),
+    re.compile(r"\b(your\s+)?(speaking|talking)\s+speed\s+(down|lower|slower)\b"),
+    re.compile(r"\b(slower|slowly)\s+(please|now|jarvis)\b"),
+    re.compile(r"\b(make|let)\s+\w+\s+slower\b"),
+    re.compile(r"\b(slowest|min(imum)?)\s+(speed|pace|rate)\b"),
+    re.compile(r"\b(speak|talk)\s+more\s+(slowly|slow)\b"),
+    re.compile(r"^\s*slower\.?\s*$"),
+]
+
+# RESET intent.
+_RESET_PATTERNS = [
+    re.compile(r"\b(normal|regular|default|standard|reset)\s+(speed|pace|rate|tempo)\b"),
+    re.compile(r"\b(reset|restore)\s+(your\s+|the\s+)?(speaking\s+)?(speed|pace|rate)\b"),
+    re.compile(r"\bback\s+to\s+(normal|regular|default)\b"),
+    re.compile(r"\b(speak|talk)\s+normally\b"),
+]
 
 
 def _classify_speed_command(text: str) -> Optional[str]:
     """Return 'faster', 'slower', 'reset', or None.
 
-    Strict-ish matching: the command must be the whole transcription or the
-    bulk of it. Prevents "I want to learn to speak faster Spanish" from
-    triggering the speed change.
+    Regex over the normalized transcript. Generous: would rather catch
+    "the speed of your talking" as a faster intent and let the user
+    correct than miss it and let the LLM hallucinate an answer about
+    speed adjustment that doesn't actually take effect.
     """
     if not text:
         return None
+    # Normalize: lowercase, replace non-alnum (except spaces) with spaces,
+    # collapse whitespace. Keeps regex patterns simple.
     norm = "".join(c.lower() if c.isalnum() or c == " " else " " for c in text)
-    norm = " ".join(norm.split())  # collapse whitespace
+    norm = " ".join(norm.split())
+    # Strip a leading/trailing "jarvis" so "Jarvis, speed up" matches.
+    norm = re.sub(r"^jarvis\b", "", norm).strip()
+    norm = re.sub(r"\bjarvis\.?\s*$", "", norm).strip()
 
-    # Whole-utterance match: the entire transcription IS a speed command.
-    for kind, phrases in (
-        ("faster", _FASTER_PHRASES),
-        ("slower", _SLOWER_PHRASES),
-        ("reset", _RESET_PHRASES),
-    ):
-        for phrase in phrases:
-            if norm == phrase or norm == phrase + " jarvis" or norm == "jarvis " + phrase:
-                return kind
-
-    # Loose match but only if the utterance is short (under 6 words). Long
-    # utterances are probably full sentences using the phrase incidentally.
-    if len(norm.split()) <= 6:
-        for kind, phrases in (
-            ("faster", _FASTER_PHRASES),
-            ("slower", _SLOWER_PHRASES),
-            ("reset", _RESET_PHRASES),
-        ):
-            if any(phrase in norm for phrase in phrases):
-                return kind
-
+    # RESET checked first so "normal speed" doesn't get caught by FASTER's
+    # generic "speed" patterns.
+    for pat in _RESET_PATTERNS:
+        if pat.search(norm):
+            return "reset"
+    for pat in _FASTER_PATTERNS:
+        if pat.search(norm):
+            return "faster"
+    for pat in _SLOWER_PATTERNS:
+        if pat.search(norm):
+            return "slower"
     return None
 
 
