@@ -49,6 +49,9 @@ Thumbs.db
 *.mp3
 recordings/
 
+# Speaker enrollment + model cache (never commit centroids, ONNX, or clips)
+state/
+
 # Secrets
 *.pem
 *.key

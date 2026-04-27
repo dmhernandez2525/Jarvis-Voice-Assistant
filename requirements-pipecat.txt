@@ -19,3 +19,14 @@ pipecat-ai[silero,openai,local,webrtc]>=1.0,<2.0
 # doesn't declare it. Without this the server dies at import time with
 # ModuleNotFoundError: No module named 'webrtcvad'.
 webrtcvad>=2.0.10
+
+# Speaker verification (jarvis_speaker.py + jarvis_enroll.py).
+# WeSpeaker ResNet34-LM ONNX runs via onnxruntime CoreML EP on M2 Max.
+# Per audit 12-Speaker-ID-Audit.md Section 8: torch>=2.7.1 closes
+# CVE-2025-32434, and we deliberately do NOT install the PyPI `wespeaker`
+# package (namespace-confusion risk; we use the official ONNX redistribution
+# at hbredin/wespeaker-voxceleb-resnet34-LM via huggingface_hub).
+onnxruntime>=1.20.0
+huggingface_hub>=0.36
+keyring>=25
+soundfile>=0.12
