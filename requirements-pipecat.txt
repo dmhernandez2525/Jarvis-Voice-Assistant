@@ -30,3 +30,7 @@ onnxruntime>=1.20.0
 huggingface_hub>=0.36
 keyring>=25
 soundfile>=0.12
+# torchaudio supplies the kaldi-compatible Fbank extractor that the
+# hbredin/wespeaker-voxceleb-resnet34-LM ONNX expects (the model takes
+# (1, T, 80) log-Fbank, not raw waveform).
+torchaudio>=2.7.1

@@ -84,15 +84,28 @@ EXPECTED_SAMPLE_RATE = 16000
 # --- Embedding ------------------------------------------------------------
 
 class WeSpeakerEmbedder:
-    """Run WeSpeaker ResNet34-LM in onnxruntime and return a 192-dim embedding.
+    """Run WeSpeaker ResNet34-LM in onnxruntime and return a 256-dim embedding.
+
+    The hbredin/wespeaker-voxceleb-resnet34-LM ONNX expects 80-dim log-Fbank
+    features at shape (1, T, 80), not raw waveform. We compute features via
+    torchaudio's kaldi-compatible extractor with WeSpeaker's standard config
+    (25ms frame, 10ms hop, 80 mel bins, dither=0.0, hamming window) and
+    apply per-utterance cepstral mean normalization, matching WeSpeaker's
+    bin/infer_onnx.py.
 
     Loads the ONNX session once and reuses it for every call. CoreML EP is
     preferred (Neural Engine + GPU on M2 Max); falls back to CPU if CoreML
     refuses the graph at first inference.
     """
 
+    NUM_MEL_BINS = 80
+    FRAME_LENGTH_MS = 25
+    FRAME_SHIFT_MS = 10
+
     def __init__(self, onnx_path: str | os.PathLike):
         import onnxruntime as ort
+        import torch  # noqa: F401  (validate availability eagerly)
+        import torchaudio.compliance.kaldi as kaldi  # noqa: F401
 
         path = Path(onnx_path)
         if not path.is_file():
@@ -119,7 +132,33 @@ class WeSpeakerEmbedder:
         if not inputs:
             raise RuntimeError("ONNX session reports zero inputs")
         self.input_name = inputs[0].name
+        # Validate input rank/shape spec matches what we expect to feed.
+        if len(inputs[0].shape) != 3 or inputs[0].shape[-1] != self.NUM_MEL_BINS:
+            raise RuntimeError(
+                f"unexpected ONNX input shape {inputs[0].shape}; "
+                f"expected (B, T, {self.NUM_MEL_BINS})"
+            )
         self.onnx_path = path
+
+    def _extract_features(self, pcm_bytes: bytes, sample_rate: int) -> np.ndarray:
+        """int16 mono PCM -> (1, T, 80) float32 log-Fbank with CMN."""
+        import torch
+        import torchaudio.compliance.kaldi as kaldi
+
+        wav = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        waveform = torch.from_numpy(wav).unsqueeze(0)  # (1, T)
+        feats = kaldi.fbank(
+            waveform,
+            num_mel_bins=self.NUM_MEL_BINS,
+            frame_length=self.FRAME_LENGTH_MS,
+            frame_shift=self.FRAME_SHIFT_MS,
+            dither=0.0,
+            sample_frequency=sample_rate,
+            window_type="hamming",
+        )
+        # Cepstral mean normalization (per-utterance), matching WeSpeaker.
+        feats = feats - feats.mean(dim=0, keepdim=True)
+        return feats.unsqueeze(0).numpy().astype(np.float32)
 
     def __call__(self, pcm_bytes: bytes, sample_rate: int) -> np.ndarray:
         """Embed a single utterance.
@@ -129,7 +168,7 @@ class WeSpeakerEmbedder:
             sample_rate: must equal EXPECTED_SAMPLE_RATE (16000).
 
         Returns:
-            L2-normalized float32 vector (typically 192-dim).
+            L2-normalized float32 vector (256-dim for ResNet34-LM).
         """
         if sample_rate != EXPECTED_SAMPLE_RATE:
             raise ValueError(
@@ -138,9 +177,8 @@ class WeSpeakerEmbedder:
         if not pcm_bytes:
             raise ValueError("empty PCM buffer")
 
-        x = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-        x = x.reshape(1, -1)
-        emb = self.sess.run(None, {self.input_name: x})[0].squeeze()
+        feats = self._extract_features(pcm_bytes, sample_rate)
+        emb = self.sess.run(None, {self.input_name: feats})[0].squeeze()
         norm = float(np.linalg.norm(emb))
         if norm < 1e-9:
             raise RuntimeError("embedding norm is zero; ONNX model misconfigured?")
