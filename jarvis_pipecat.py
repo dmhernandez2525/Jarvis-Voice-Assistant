@@ -1,0 +1,1057 @@
+#!/usr/bin/env python3
+"""JARVIS Voice Assistant, Pipecat full-duplex variant (Option C).
+
+Pipeline:
+    mic -> Silero VAD -> Parakeet-MLX STT -> Gemma 4 (via Ollama OpenAI-compat)
+       -> Kokoro-82M TTS (via mlx_audio.server OpenAI-compat) -> speaker
+
+Full-duplex behavior: once VAD detects the user is speaking, Pipecat
+automatically cancels any in-flight TTS output, so you can barge in on
+the assistant without waiting for it to finish.
+
+Requires these services running BEFORE this script starts. The launcher
+(`run-jarvis-pipecat.sh`) handles both:
+
+    1. Ollama:          http://127.0.0.1:11434   (ollama serve)
+    2. mlx-audio:       http://127.0.0.1:8000    (python -m mlx_audio.server
+                                                  --host 127.0.0.1 --port 8000)
+
+All pinned env-overridable knobs use JARVIS_* variables, same as
+jarvis_gemma4_router.py.
+
+Security posture (per 05-Pipecat-Scenario-C-Audit.md):
+  - Silero VAD uses Pipecat's bundled ONNX file (confirmed by audit,
+    JIT/pickle path is not reachable).
+  - We use our own mlx_audio.server for TTS (NOT Pipecat's kokoro service,
+    which pulls kokoro-onnx from a 4-link pseudonymous supply chain).
+  - All endpoints bound to 127.0.0.1 by default.
+  - Parakeet-MLX weights are safetensors-only (confirmed by audit).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import io
+import os
+import tempfile
+import time
+import wave
+from typing import AsyncGenerator, Optional
+
+import numpy as np
+
+# Pipecat
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
+from pipecat.processors.audio.vad_processor import VADProcessor
+from pipecat.frames.frames import (
+    ErrorFrame,
+    Frame,
+    TranscriptionFrame,
+    TTSSpeakFrame,
+    TTSUpdateSettingsFrame,
+)
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.pipeline.runner import PipelineRunner
+from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContext,
+    LLMContextAggregatorPair,
+)
+from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.tts_service import TTSService
+from pipecat.services.stt_service import SegmentedSTTService
+from pipecat.frames.frames import (
+    TTSAudioRawFrame,
+    TTSStartedFrame,
+    TTSStoppedFrame,
+)
+from pipecat.transports.local.audio import (
+    LocalAudioTransport,
+    LocalAudioTransportParams,
+)
+from pipecat.frames.frames import (
+    InputAudioRawFrame,
+    BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
+)
+from pipecat.utils.time import time_now_iso8601
+
+# Ours
+from jarvis_logging import setup_logging, write_session_summary
+
+# --- Config ----------------------------------------------------------------
+
+STT_MODEL_ID = os.environ.get(
+    "JARVIS_STT_MODEL", "mlx-community/parakeet-tdt-0.6b-v3"
+)
+
+LLM_BASE_URL = os.environ.get("JARVIS_LLM_BASE_URL", "http://127.0.0.1:11434/v1")
+# gemma4:e4b has ~300ms time-to-first-token vs gemma4:26b's ~1s+ because its
+# weights are 9.6GB vs 17GB. For conversational voice UX the perceived speed
+# dominates the modest quality gap. Override via JARVIS_LLM_MODEL=gemma4:26b
+# for harder reasoning questions.
+LLM_MODEL = os.environ.get("JARVIS_LLM_MODEL", "gemma4:e4b")
+LLM_TEMPERATURE = float(os.environ.get("JARVIS_LLM_TEMPERATURE", "0.7"))
+# Cap reply length so voice replies are short. Empirically Gemma 4 stays
+# under 60 tokens for one-sentence answers; 120 leaves headroom for
+# two-sentence replies without runaway.
+LLM_MAX_TOKENS = int(os.environ.get("JARVIS_LLM_MAX_TOKENS", "120"))
+# Gemma 4 has thinking-mode capability. With thinking ON (Ollama default)
+# the model burns 200+ hidden tokens of internal reasoning before each
+# answer, taking 5-23s for a one-sentence reply that would otherwise be
+# 0.5s. Setting reasoning_effort=none on the Ollama /v1 OpenAI-compat
+# shim disables thinking. Verified 2026-04-24: same prompt, same model,
+# reasoning_effort=none = 0.53s vs default = 9.51s (18x faster).
+LLM_REASONING_EFFORT = os.environ.get("JARVIS_LLM_REASONING_EFFORT", "none")
+
+TTS_BASE_URL = os.environ.get("JARVIS_TTS_BASE_URL", "http://127.0.0.1:8000/v1")
+TTS_MODEL = os.environ.get("JARVIS_TTS_MODEL", "mlx-community/Kokoro-82M-bf16")
+TTS_VOICE = os.environ.get("JARVIS_TTS_VOICE", "am_michael")
+TTS_SPEED_MIN = float(os.environ.get("JARVIS_TTS_SPEED_MIN", "0.5"))
+TTS_SPEED_MAX = float(os.environ.get("JARVIS_TTS_SPEED_MAX", "2.0"))
+TTS_SPEED_STEP = float(os.environ.get("JARVIS_TTS_SPEED_STEP", "0.2"))
+TTS_SPEED_DEFAULT = float(os.environ.get("JARVIS_TTS_SPEED_DEFAULT", "1.0"))
+
+# Silero VAD tuning. Pipecat's defaults are confidence=0.7 and min_volume=0.6,
+# which are calibrated for loud close-mic recordings. Real laptop mic audio
+# inside Pipecat's pipeline comes through quieter than standalone PyAudio
+# (mean ~0.001 idle, peaks under 0.01 in early probe runs even when Daniel
+# was speaking), so thresholds here are aggressive by design.
+VAD_CONFIDENCE = float(os.environ.get("JARVIS_VAD_CONFIDENCE", "0.5"))
+VAD_MIN_VOLUME = float(os.environ.get("JARVIS_VAD_MIN_VOLUME", "0.005"))
+VAD_START_SECS = float(os.environ.get("JARVIS_VAD_START_SECS", "0.2"))
+VAD_STOP_SECS = float(os.environ.get("JARVIS_VAD_STOP_SECS", "0.3"))
+
+# Sample rates: Pipecat defaults are 16k in, 24k out for TTS.
+AUDIO_IN_SR = int(os.environ.get("JARVIS_AUDIO_IN_SR", "16000"))
+AUDIO_OUT_SR = int(os.environ.get("JARVIS_AUDIO_OUT_SR", "24000"))
+
+SYSTEM_PROMPT = os.environ.get(
+    "JARVIS_SYSTEM_PROMPT",
+    (
+        "You are JARVIS, a local voice assistant running on a MacBook Pro. "
+        "Always reply in ONE or TWO short sentences. No lists, no headers, "
+        "no preamble like 'Sure!' or 'Of course'. Speak like a person, "
+        "not a chatbot. If you don't know something, say so plainly in "
+        "one sentence rather than guessing."
+    ),
+)
+
+# --- Logging ---------------------------------------------------------------
+
+logger, events, SESSION_ID, SESSION_START = setup_logging(name="jarvis.pipecat")
+
+
+# --- Kokoro TTS service (direct HTTP, no OpenAI SDK validation) -----------
+
+class KokoroTTSService(TTSService):
+    """Custom TTS service that hits mlx_audio.server's OpenAI-compatible
+    endpoint directly via httpx, bypassing the official openai SDK's
+    client-side voice-name enum.
+
+    Pipecat's OpenAITTSService validates voice names against VALID_VOICES
+    (alloy, echo, fable, onyx, nova, shimmer) on the client before sending
+    the request, which immediately KeyErrors on Kokoro voice ids like
+    am_michael / af_heart. mlx-audio's server accepts any voice the
+    underlying Kokoro model supports.
+
+    Streams PCM16 audio back via TTSAudioRawFrame. TTSUpdateSettingsFrame
+    (emitted by SpeechRateController) is handled by the base class; we
+    re-read self._speed on every run_tts call.
+    """
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        model: str,
+        voice: str,
+        speed: float = 1.0,
+        sample_rate: int = 24000,
+        request_timeout_s: float = 30.0,
+        **kwargs,
+    ):
+        # TTSService expects a settings object for compatibility with the
+        # settings-validator; we pass minimal fields.
+        from pipecat.services.settings import TTSSettings
+        tts_settings = TTSSettings(
+            model=model,
+            voice=voice,
+            language=None,
+        )
+        super().__init__(sample_rate=sample_rate, settings=tts_settings, **kwargs)
+        self._base_url = base_url.rstrip("/")
+        self._model = model
+        self._voice = voice
+        self._speed = speed
+        self._sample_rate = sample_rate
+        self._request_timeout_s = request_timeout_s
+        self._client = None  # lazily constructed
+        logger.info(
+            "KokoroTTSService configured: base_url=%s voice=%s model=%s speed=%.1f",
+            self._base_url, self._voice, self._model, self._speed,
+        )
+
+    async def _get_client(self):
+        if self._client is None:
+            import httpx
+            self._client = httpx.AsyncClient(
+                base_url=self._base_url, timeout=self._request_timeout_s,
+            )
+        return self._client
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        """Intercept TTSUpdateSettingsFrame so SpeechRateController commands
+        actually land on our in-memory speed/voice without needing the base
+        TTSService's Settings-object plumbing (which doesn't know about the
+        provider-specific `speed` field on TTSSettings).
+        """
+        # Update our fields FIRST (before super), then let the base class
+        # handle the frame as it sees fit for its own internal state.
+        if isinstance(frame, TTSUpdateSettingsFrame):
+            # Pipecat 1.0's TTSUpdateSettingsFrame can carry either a dict
+            # (legacy) or a delta Settings object. SpeechRateController uses
+            # the dict form: settings={"speed": N} or {"voice": "am_adam"}.
+            extracted = {}
+            if frame.settings:
+                extracted.update(dict(frame.settings))
+            if frame.delta is not None:
+                delta_dict = getattr(frame.delta, "model_dump", lambda: {})()
+                for k, v in delta_dict.items():
+                    if v is not None:
+                        extracted[k] = v
+            if "speed" in extracted:
+                self._speed = float(extracted["speed"])
+                logger.info("KokoroTTSService: speed updated to %.2fx", self._speed)
+                events.event("tts_speed_changed", new_speed=self._speed)
+            if "voice" in extracted:
+                self._voice = str(extracted["voice"])
+                logger.info("KokoroTTSService: voice updated to %s", self._voice)
+                events.event("tts_voice_changed", new_voice=self._voice)
+
+        await super().process_frame(frame, direction)
+
+    async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
+        """POST to mlx_audio.server /v1/audio/speech, stream PCM audio back."""
+        logger.debug("KokoroTTSService: generating [%s]", text[:80])
+        yield TTSStartedFrame()
+        await self.start_processing_metrics()
+        try:
+            client = await self._get_client()
+            payload = {
+                "input": text,
+                "model": self._model,
+                "voice": self._voice,
+                "response_format": "pcm",
+                "speed": self._speed,
+            }
+            t0 = time.time()
+            # Base URL already contains /v1 (OpenAI convention), so the
+            # relative path is just /audio/speech. Earlier this was
+            # /v1/audio/speech which produced /v1/v1/audio/speech and 404.
+            async with client.stream(
+                "POST", "/audio/speech", json=payload,
+            ) as r:
+                if r.status_code != 200:
+                    body = await r.aread()
+                    err_text = body.decode("utf-8", errors="replace")[:500]
+                    logger.error(
+                        "KokoroTTSService: upstream %d: %s", r.status_code, err_text,
+                    )
+                    events.event(
+                        "tts_upstream_error", status=r.status_code, body=err_text[:200],
+                    )
+                    yield ErrorFrame(
+                        error=f"mlx_audio.server returned {r.status_code}: {err_text}",
+                    )
+                    return
+
+                first_chunk_ms = None
+                total_bytes = 0
+                async for chunk in r.aiter_bytes(chunk_size=4096):
+                    if not chunk:
+                        continue
+                    if first_chunk_ms is None:
+                        first_chunk_ms = int((time.time() - t0) * 1000)
+                    total_bytes += len(chunk)
+                    # mlx-audio returns raw PCM16 at the model's sample rate.
+                    # PCM response_format is signed-16bit little-endian mono.
+                    yield TTSAudioRawFrame(
+                        audio=chunk,
+                        sample_rate=self._sample_rate,
+                        num_channels=1,
+                        context_id=context_id,
+                    )
+
+                total_ms = int((time.time() - t0) * 1000)
+                logger.info(
+                    "KokoroTTSService: %d bytes streamed in %dms (first chunk %dms)",
+                    total_bytes, total_ms, first_chunk_ms or -1,
+                )
+                events.event(
+                    "tts_streamed",
+                    bytes=total_bytes,
+                    total_ms=total_ms,
+                    first_chunk_ms=first_chunk_ms,
+                    speed=self._speed,
+                    voice=self._voice,
+                )
+        except Exception as e:
+            logger.error("KokoroTTSService: unexpected error: %s", e, exc_info=True)
+            events.event("tts_error", error=str(e), exception_type=type(e).__name__)
+            yield ErrorFrame(error=f"KokoroTTSService failure: {e}")
+        finally:
+            await self.stop_processing_metrics()
+            yield TTSStoppedFrame()
+
+
+# --- Parakeet-MLX STT service ---------------------------------------------
+
+class ParakeetMLXSTTService(SegmentedSTTService):
+    """SegmentedSTTService that transcribes complete speech segments
+    using Parakeet-MLX.
+
+    MLX has per-thread GPU default streams. A model loaded on thread A
+    cannot be evaluated on thread B (`RuntimeError: There is no
+    Stream(gpu, 0) in current thread.`). To satisfy this requirement
+    without blocking the asyncio event loop, ALL model work (load +
+    inference) runs on a single dedicated worker thread, exposed via a
+    ThreadPoolExecutor(max_workers=1).
+    """
+
+    def __init__(
+        self,
+        *,
+        model_id: str,
+        preloaded_model: Optional[object] = None,
+        sample_rate: Optional[int] = None,
+        **kwargs,
+    ):
+        from pipecat.services.stt_service import STTSettings
+        stt_settings = kwargs.pop("settings", None) or STTSettings(
+            model=model_id,
+            language=None,
+        )
+        super().__init__(sample_rate=sample_rate, settings=stt_settings, **kwargs)
+        self._model_id = model_id
+        self._model = None  # always loaded lazily on the dedicated thread
+
+        from concurrent.futures import ThreadPoolExecutor
+        # Single-thread executor. Every Parakeet op (load + transcribe) runs
+        # on this one thread, so MLX stream state stays consistent.
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="jarvis-parakeet"
+        )
+
+        # If a preloaded model was passed in (from warm_start), we can't
+        # actually use it directly because it was created on a different
+        # thread. Instead, schedule a re-load on our dedicated thread.
+        # This adds ~1s of latency on first transcription but is the only
+        # way to keep MLX happy.
+        if preloaded_model is not None:
+            logger.info(
+                "ParakeetMLXSTTService: ignoring preloaded model (loaded on "
+                "wrong thread for MLX); will re-load on dedicated worker."
+            )
+        logger.info(
+            "ParakeetMLXSTTService configured with dedicated worker thread: %s",
+            model_id,
+        )
+
+    def _ensure_model_loaded(self):
+        """Called on the dedicated worker thread. Idempotent."""
+        if self._model is not None:
+            return
+        from parakeet_mlx import from_pretrained
+        logger.info("Loading Parakeet-MLX weights on dedicated worker thread...")
+        self._model = from_pretrained(self._model_id)
+        logger.info("Parakeet-MLX ready (dedicated worker)")
+
+    def _transcribe_sync(self, wav_path: str):
+        """Runs on the dedicated worker thread. Loads model if needed."""
+        self._ensure_model_loaded()
+        return self._model.transcribe(wav_path)
+
+    async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame, None]:
+        try:
+            await self.start_processing_metrics()
+
+            fd, path = tempfile.mkstemp(suffix=".wav", prefix="jarvis-stt-")
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(audio)
+                loop = asyncio.get_running_loop()
+                # run_in_executor dispatches to our single-thread pool, so
+                # the first call loads the model AND all subsequent calls
+                # reuse the same MLX-initialized thread.
+                result = await loop.run_in_executor(
+                    self._executor, self._transcribe_sync, path,
+                )
+            finally:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+            await self.stop_processing_metrics()
+
+            text = (result.text if hasattr(result, "text") else str(result)).strip()
+
+            if not text:
+                logger.debug("Parakeet returned empty transcription")
+                events.event("stt_empty")
+                return
+
+            logger.info("Parakeet transcribed: %r", text[:120])
+            events.event("stt_transcribe", text=text, text_len=len(text))
+
+            yield TranscriptionFrame(
+                text,
+                getattr(self, "_user_id", "") or "",
+                time_now_iso8601(),
+                result=result,
+            )
+        except Exception as e:
+            logger.error("Parakeet STT failed: %s", e, exc_info=True)
+            events.event("stt_error", error=str(e), exception_type=type(e).__name__)
+            yield ErrorFrame(error=f"STT failure: {e}")
+
+
+# --- Voice-controlled speech-rate commands --------------------------------
+
+import re
+
+# Speed-change intent matching. People phrase these many ways; matching only
+# literal "speak faster" was too strict (real-world test 2026-04-26 caught
+# "Can you increase the speed of your talking?" / "Let's see what the
+# fastest that you can go is" / "increase the speaking speed" — none of
+# which fired the controller, so the LLM fielded them and made up answers).
+#
+# Approach: regex patterns over a normalized (lowercase, alnum+space)
+# transcript. Patterns are intentionally generous because the cost of a
+# false positive (TTS speed changes when user didn't ask) is small,
+# while the cost of a false negative (user keeps repeating themselves
+# while the LLM fabricates) is the bug we just hit.
+
+# FASTER intent: any pattern that asks for more speed.
+_FASTER_PATTERNS = [
+    re.compile(r"\b(speak|talk|go|reply|respond)\w*\s+(faster|quicker|quickly)\b"),
+    re.compile(r"\bspeed\s+(it\s+)?up\b"),
+    re.compile(r"\b(increase|raise|bump|crank)\s+(up\s+)?(your\s+|the\s+)?(speaking\s+)?(speed|pace|rate|tempo)\b"),
+    re.compile(r"\b(your\s+)?(speaking|talking)\s+speed\s+(up|higher|faster)\b"),
+    re.compile(r"\b(faster|quicker|quickly)\s+(please|now|jarvis)\b"),
+    re.compile(r"\b(make|let)\s+\w+\s+(faster|quicker)\b"),
+    re.compile(r"\b(fastest|max(imum)?)\s+(speed|pace|rate)\b"),
+    re.compile(r"\bfastest\s+(you|jarvis|that)\b"),
+    re.compile(r"\b(speak|talk)\s+more\s+(quickly|fast)\b"),
+    re.compile(r"^\s*faster\.?\s*$"),
+]
+
+# SLOWER intent.
+_SLOWER_PATTERNS = [
+    re.compile(r"\b(speak|talk|go|reply|respond)\w*\s+(slower|slowly)\b"),
+    re.compile(r"\bslow\s+(it\s+)?down\b"),
+    re.compile(r"\b(decrease|lower|reduce|drop)\s+(down\s+)?(your\s+|the\s+)?(speaking\s+)?(speed|pace|rate|tempo)\b"),
+    re.compile(r"\b(your\s+)?(speaking|talking)\s+speed\s+(down|lower|slower)\b"),
+    re.compile(r"\b(slower|slowly)\s+(please|now|jarvis)\b"),
+    re.compile(r"\b(make|let)\s+\w+\s+slower\b"),
+    re.compile(r"\b(slowest|min(imum)?)\s+(speed|pace|rate)\b"),
+    re.compile(r"\b(speak|talk)\s+more\s+(slowly|slow)\b"),
+    re.compile(r"^\s*slower\.?\s*$"),
+]
+
+# RESET intent.
+_RESET_PATTERNS = [
+    re.compile(r"\b(normal|regular|default|standard|reset)\s+(speed|pace|rate|tempo)\b"),
+    re.compile(r"\b(reset|restore)\s+(your\s+|the\s+)?(speaking\s+)?(speed|pace|rate)\b"),
+    re.compile(r"\bback\s+to\s+(normal|regular|default)\b"),
+    re.compile(r"\b(speak|talk)\s+normally\b"),
+]
+
+
+def _classify_speed_command(text: str) -> Optional[str]:
+    """Return 'faster', 'slower', 'reset', or None.
+
+    Regex over the normalized transcript. Generous: would rather catch
+    "the speed of your talking" as a faster intent and let the user
+    correct than miss it and let the LLM hallucinate an answer about
+    speed adjustment that doesn't actually take effect.
+    """
+    if not text:
+        return None
+    # Normalize: lowercase, replace non-alnum (except spaces) with spaces,
+    # collapse whitespace. Keeps regex patterns simple.
+    norm = "".join(c.lower() if c.isalnum() or c == " " else " " for c in text)
+    norm = " ".join(norm.split())
+    # Strip a leading/trailing "jarvis" so "Jarvis, speed up" matches.
+    norm = re.sub(r"^jarvis\b", "", norm).strip()
+    norm = re.sub(r"\bjarvis\.?\s*$", "", norm).strip()
+
+    # RESET checked first so "normal speed" doesn't get caught by FASTER's
+    # generic "speed" patterns.
+    for pat in _RESET_PATTERNS:
+        if pat.search(norm):
+            return "reset"
+    for pat in _FASTER_PATTERNS:
+        if pat.search(norm):
+            return "faster"
+    for pat in _SLOWER_PATTERNS:
+        if pat.search(norm):
+            return "slower"
+    return None
+
+
+# --- Input audio gate (prevents acoustic self-triggering) ------------------
+
+# When the Mac speaker plays Jarvis's TTS, the built-in mic picks it up,
+# Silero VAD flags it as "user speaking," and the interruption system
+# kills Jarvis's own TTS. Symptom: you hear only the first word or two,
+# then silence + Parakeet ends up transcribing the bot's own output.
+#
+# The gate below drops InputAudioRawFrames while the bot is speaking
+# (BotStartedSpeakingFrame..BotStoppedSpeakingFrame window), giving us
+# "half-duplex" mode: you wait for the bot to finish before you can
+# interrupt by voice. Real acoustic echo cancellation (WebRTC AEC3 or
+# similar) would allow true barge-in even from laptop speakers; that's
+# a bigger piece of work.
+#
+# Users on headphones won't have the self-trigger problem; they can set
+# JARVIS_INPUT_GATE=0 to keep true barge-in.
+INPUT_GATE_ENABLED = os.environ.get("JARVIS_INPUT_GATE", "1") not in ("0", "false", "False")
+
+
+class InputAudioGate(FrameProcessor):
+    """Gates InputAudioRawFrame while the bot is mid-TTS.
+
+    Listens for BotStartedSpeakingFrame and BotStoppedSpeakingFrame (which
+    flow upstream from the TTS/output transport). While the bot flag is
+    set, silently drops any InputAudioRawFrame so Silero VAD doesn't see
+    the speaker leak. Other frame types pass through in both directions.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._bot_speaking = False
+        self._dropped_while_speaking = 0
+        logger.info("InputAudioGate armed (half-duplex mode to prevent self-trigger)")
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, BotStartedSpeakingFrame):
+            self._bot_speaking = True
+            self._dropped_while_speaking = 0
+            logger.info("InputAudioGate: muting mic (bot speaking)")
+            events.event("input_gate_closed")
+            await self.push_frame(frame, direction)
+            return
+
+        if isinstance(frame, BotStoppedSpeakingFrame):
+            self._bot_speaking = False
+            logger.info(
+                "InputAudioGate: unmuting mic (bot stopped, dropped %d audio frames)",
+                self._dropped_while_speaking,
+            )
+            events.event(
+                "input_gate_opened", dropped_frames=self._dropped_while_speaking,
+            )
+            await self.push_frame(frame, direction)
+            return
+
+        # Drop audio frames while bot is speaking.
+        if self._bot_speaking and isinstance(frame, InputAudioRawFrame):
+            self._dropped_while_speaking += 1
+            return
+
+        await self.push_frame(frame, direction)
+
+
+# --- Debug probe ----------------------------------------------------------
+
+AUDIO_PROBE_ENABLED = os.environ.get("JARVIS_AUDIO_PROBE", "1") not in ("0", "false", "False")
+
+
+class AudioFrameProbe(FrameProcessor):
+    """Diagnostic processor: tracks audio amplitude across every frame so
+    transient speech peaks can't hide between probe windows.
+
+    Logs:
+      - One-shot on first frame (format + sample rate)
+      - Periodic window summary: MAX peak and cumulative above-threshold
+        count since last log
+      - Instant trigger on any single frame whose peak exceeds
+        `loud_frame_peak` (default 0.05, tuned below typical speech peaks)
+
+    Without the per-window max + instant trigger, sampling only the last
+    frame in each window means 99% of probe readings land on inter-word
+    silence and the fact that loud frames DID arrive gets lost.
+    """
+
+    AUDIO_PROBE_EVERY = int(os.environ.get("JARVIS_AUDIO_PROBE_EVERY", "250"))
+    LOUD_FRAME_PEAK = float(os.environ.get("JARVIS_AUDIO_LOUD_FRAME_PEAK", "0.05"))
+
+    def __init__(self):
+        super().__init__()
+        self._count = 0
+        self._first_logged = False
+        # Rolling window stats (reset every log)
+        self._window_max_peak = 0.0
+        self._window_sum_mean = 0.0
+        self._window_loud_frame_count = 0
+        self._instant_log_budget = int(
+            os.environ.get("JARVIS_AUDIO_INSTANT_LOG_BUDGET", "10")
+        )
+        logger.info(
+            "AudioFrameProbe armed (window=%d frames, loud-frame trigger >%.3f peak, "
+            "instant-log budget %d)",
+            self.AUDIO_PROBE_EVERY, self.LOUD_FRAME_PEAK, self._instant_log_budget,
+        )
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, InputAudioRawFrame):
+            self._count += 1
+
+            if not self._first_logged:
+                self._first_logged = True
+                logger.info(
+                    "AudioFrameProbe: FIRST audio frame received "
+                    "(sample_rate=%d, bytes=%d, channels=%d)",
+                    frame.sample_rate, len(frame.audio), frame.num_channels,
+                )
+                events.event(
+                    "audio_first_frame",
+                    sample_rate=frame.sample_rate,
+                    bytes=len(frame.audio),
+                )
+
+            samples = np.frombuffer(frame.audio, dtype=np.int16).astype(np.float32) / 32768.0
+            mean_abs = float(np.abs(samples).mean())
+            peak = float(np.abs(samples).max())
+
+            # Update rolling window stats
+            if peak > self._window_max_peak:
+                self._window_max_peak = peak
+            self._window_sum_mean += mean_abs
+            if peak >= self.LOUD_FRAME_PEAK:
+                self._window_loud_frame_count += 1
+
+                # Instant log on loud frames so we can SEE speech arrive
+                # in real time, not averaged away. Rate-limited to avoid
+                # spamming the log.
+                if self._instant_log_budget > 0:
+                    self._instant_log_budget -= 1
+                    logger.info(
+                        "AudioFrameProbe: loud frame #%d at count=%d, peak=%.4f mean=%.4f "
+                        "(instant-log budget %d remaining)",
+                        self._window_loud_frame_count, self._count, peak, mean_abs,
+                        self._instant_log_budget,
+                    )
+                    events.event(
+                        "audio_loud_frame", count=self._count, peak=peak, mean_abs=mean_abs,
+                    )
+
+            # Periodic window summary
+            if self._count % self.AUDIO_PROBE_EVERY == 0:
+                avg_mean = self._window_sum_mean / self.AUDIO_PROBE_EVERY
+                logger.info(
+                    "AudioFrameProbe: %d total frames, window max_peak=%.4f "
+                    "avg_mean=%.4f loud_frames=%d",
+                    self._count, self._window_max_peak, avg_mean,
+                    self._window_loud_frame_count,
+                )
+                events.event(
+                    "audio_probe_window",
+                    frame_count=self._count,
+                    window_max_peak=self._window_max_peak,
+                    window_avg_mean=avg_mean,
+                    window_loud_frames=self._window_loud_frame_count,
+                )
+                # Reset window
+                self._window_max_peak = 0.0
+                self._window_sum_mean = 0.0
+                self._window_loud_frame_count = 0
+
+        await self.push_frame(frame, direction)
+
+
+class SpeechRateController(FrameProcessor):
+    """Intercepts TranscriptionFrames that are speech-rate commands.
+
+    When the user says "speak faster" / "speak slower" / "normal speed",
+    this processor:
+      1. Computes the new speed (clamped to TTS_SPEED_MIN..TTS_SPEED_MAX)
+      2. Pushes a TTSUpdateSettingsFrame so the TTS service reconfigures
+      3. Pushes a TTSSpeakFrame with the acknowledgment (bypasses the LLM)
+      4. Drops the original TranscriptionFrame so it never reaches the
+         LLM context (speed commands are meta, not conversation)
+
+    All other frames pass through unchanged.
+    """
+
+    def __init__(self, *, initial_speed: float = TTS_SPEED_DEFAULT):
+        super().__init__()
+        self._speed = max(TTS_SPEED_MIN, min(TTS_SPEED_MAX, initial_speed))
+        logger.info(
+            "SpeechRateController ready (speed=%.1fx, step=%.1f, range=%.1f-%.1fx)",
+            self._speed, TTS_SPEED_STEP, TTS_SPEED_MIN, TTS_SPEED_MAX,
+        )
+
+    @property
+    def current_speed(self) -> float:
+        return self._speed
+
+    def _compute_new_speed(self, kind: str) -> tuple[float, str]:
+        """Return (new_speed, ack_text) for the given command kind."""
+        if kind == "reset":
+            new_speed = TTS_SPEED_DEFAULT
+            ack = "Back to normal speed."
+        elif kind == "faster":
+            new_speed = min(TTS_SPEED_MAX, self._speed + TTS_SPEED_STEP)
+            if new_speed == self._speed:
+                ack = f"Already at maximum speed, sir."
+            else:
+                ack = "Speaking faster."
+        else:  # slower
+            new_speed = max(TTS_SPEED_MIN, self._speed - TTS_SPEED_STEP)
+            if new_speed == self._speed:
+                ack = "Already at minimum speed, sir."
+            else:
+                ack = "Speaking slower."
+        return new_speed, ack
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        # Always call super first so FrameProcessor state is updated.
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, TranscriptionFrame):
+            kind = _classify_speed_command(frame.text)
+            if kind is not None:
+                new_speed, ack = self._compute_new_speed(kind)
+                old_speed = self._speed
+                self._speed = new_speed
+
+                logger.info(
+                    "Speech rate command: kind=%s %.1fx -> %.1fx (ack=%r)",
+                    kind, old_speed, new_speed, ack,
+                )
+                events.event(
+                    "speech_rate_change",
+                    kind=kind,
+                    old_speed=old_speed,
+                    new_speed=new_speed,
+                    trigger=frame.text,
+                )
+
+                # 1. Update TTS settings so subsequent speech uses the new speed.
+                await self.push_frame(
+                    TTSUpdateSettingsFrame(settings={"speed": new_speed}),
+                    direction,
+                )
+                # 2. Speak the acknowledgment directly, bypassing the LLM.
+                await self.push_frame(
+                    TTSSpeakFrame(ack, append_to_context=False),
+                    direction,
+                )
+                # 3. Do NOT propagate the original TranscriptionFrame.
+                #    The LLM context should not see the speed command.
+                return
+
+        # Every other frame passes through unchanged.
+        await self.push_frame(frame, direction)
+
+
+# --- Warm-start ------------------------------------------------------------
+
+WARMUP_ENABLED = os.environ.get("JARVIS_WARMUP", "1") not in ("0", "false", "False")
+
+
+def _warm_parakeet():
+    """Pre-download Parakeet-MLX weights (does NOT keep the model, because
+    MLX requires model+inference on the same thread). The real model load
+    happens on the dedicated STT worker thread on first transcription.
+    This just ensures the HF cache is populated so that first load is fast.
+    """
+    logger.info("Warm-up: pre-fetching Parakeet-MLX weight cache...")
+    t0 = time.time()
+    try:
+        # Instantiating from_pretrained forces the download; the returned
+        # model object will be discarded (garbage collected) so only the
+        # on-disk HF cache benefits. If the cache is already populated this
+        # is fast.
+        from parakeet_mlx import from_pretrained
+        _throwaway = from_pretrained(STT_MODEL_ID)
+        del _throwaway
+    except Exception as e:
+        logger.warning("Warm-up: Parakeet pre-fetch failed (will lazy-load): %s", e)
+    ms = int((time.time() - t0) * 1000)
+    logger.info("Warm-up: Parakeet cache primed in %dms", ms)
+    events.event("warmup_stt", duration_ms=ms)
+    return None  # Model itself is reloaded on the STT worker thread.
+
+
+def _warm_ollama():
+    """Send a tiny generate call so Ollama loads the LLM into Metal."""
+    import ollama
+    logger.info("Warm-up: pre-warming Ollama %s (keep_alive=15m)...", LLM_MODEL)
+    t0 = time.time()
+    try:
+        ollama.generate(
+            model=LLM_MODEL,
+            prompt="Hello.",
+            stream=False,
+            keep_alive="15m",
+            options={"num_predict": 1, "temperature": 0.1},
+        )
+    except Exception as e:
+        logger.error("Warm-up: Ollama call failed: %s", e, exc_info=True)
+        events.event("warmup_llm_error", error=str(e))
+        return
+    ms = int((time.time() - t0) * 1000)
+    logger.info("Warm-up: Ollama %s resident in %dms", LLM_MODEL, ms)
+    events.event("warmup_llm", duration_ms=ms, model=LLM_MODEL)
+
+
+def _warm_kokoro():
+    """Generate one tiny Kokoro clip so the voice file is cached and the
+    mlx-audio server has loaded weights into Metal.
+
+    Note: we call the mlx-audio Python API directly rather than hitting the
+    running server, because the server warmup happens on its first request.
+    Using the Python API gets BOTH paths warm in one go.
+    """
+    from mlx_audio.tts.generate import generate_audio
+    logger.info("Warm-up: generating a throwaway Kokoro clip (voice=%s)...", TTS_VOICE)
+    t0 = time.time()
+    tmp_dir = tempfile.mkdtemp(prefix="jarvis-warmup-")
+    prefix = os.path.join(tmp_dir, "warmup")
+    try:
+        generate_audio(
+            text="Ready.",
+            model=TTS_MODEL,
+            voice=TTS_VOICE,
+            file_prefix=prefix,
+            audio_format="wav",
+            lang_code="a",
+            join_audio=True,
+            verbose=False,
+        )
+    except Exception as e:
+        logger.error("Warm-up: Kokoro generate failed: %s", e, exc_info=True)
+        events.event("warmup_tts_error", error=str(e))
+        return
+    finally:
+        # Clean up any produced files.
+        try:
+            for name in os.listdir(tmp_dir):
+                try:
+                    os.unlink(os.path.join(tmp_dir, name))
+                except OSError:
+                    pass
+            os.rmdir(tmp_dir)
+        except OSError:
+            pass
+    ms = int((time.time() - t0) * 1000)
+    logger.info("Warm-up: Kokoro ready in %dms", ms)
+    events.event("warmup_tts", duration_ms=ms, voice=TTS_VOICE)
+
+
+async def warm_start() -> object:
+    """Pre-load all three stages in parallel-on-threads so user's first
+    utterance doesn't eat a 15-20s cold-load penalty.
+
+    Returns the preloaded Parakeet model (or None if warmup disabled).
+    """
+    if not WARMUP_ENABLED:
+        logger.info("Warm-up disabled (JARVIS_WARMUP=0). First query will be slow.")
+        return None
+
+    logger.info("Warm-up: starting (all three stages in parallel)")
+    events.event("warmup_start")
+    t0 = time.time()
+
+    # Run all three warmups concurrently on threads to minimize wall time.
+    results = await asyncio.gather(
+        asyncio.to_thread(_warm_parakeet),
+        asyncio.to_thread(_warm_ollama),
+        asyncio.to_thread(_warm_kokoro),
+        return_exceptions=True,
+    )
+
+    parakeet_result = results[0]
+    for i, r in enumerate(results):
+        if isinstance(r, Exception):
+            name = ("parakeet", "ollama", "kokoro")[i]
+            logger.error("Warm-up: %s raised %s: %s", name, type(r).__name__, r)
+
+    total_ms = int((time.time() - t0) * 1000)
+    logger.info("Warm-up: all stages ready in %dms (wall)", total_ms)
+    events.event("warmup_complete", duration_ms=total_ms)
+
+    return parakeet_result if not isinstance(parakeet_result, Exception) else None
+
+
+# --- Main ------------------------------------------------------------------
+
+async def main() -> None:
+    logger.info("Starting Jarvis Pipecat (Option C, full-duplex local)")
+    events.event(
+        "pipecat_config",
+        stt_model=STT_MODEL_ID,
+        llm_base_url=LLM_BASE_URL,
+        llm_model=LLM_MODEL,
+        tts_base_url=TTS_BASE_URL,
+        tts_model=TTS_MODEL,
+        tts_voice=TTS_VOICE,
+        warmup_enabled=WARMUP_ENABLED,
+    )
+
+    preloaded_parakeet = await warm_start()
+
+    vad_params = VADParams(
+        confidence=VAD_CONFIDENCE,
+        start_secs=VAD_START_SECS,
+        stop_secs=VAD_STOP_SECS,
+        min_volume=VAD_MIN_VOLUME,
+    )
+    logger.info(
+        "VAD tuning: confidence=%.2f min_volume=%.2f start_secs=%.2f stop_secs=%.2f",
+        VAD_CONFIDENCE, VAD_MIN_VOLUME, VAD_START_SECS, VAD_STOP_SECS,
+    )
+
+    # Note: Pipecat 1.0 accepts `vad_analyzer=` on LocalAudioTransportParams
+    # but LocalAudioInputTransport's audio task handler doesn't actually call
+    # it (verified by grepping pipecat.transports.base_input — zero refs to
+    # vad_analyzer in the handler). We wire VAD explicitly via VADProcessor
+    # in the pipeline below. The param is passed here for forward-compat if
+    # Pipecat later starts honoring it, but is functionally vestigial today.
+    transport = LocalAudioTransport(
+        LocalAudioTransportParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            audio_in_sample_rate=AUDIO_IN_SR,
+            audio_out_sample_rate=AUDIO_OUT_SR,
+            vad_analyzer=SileroVADAnalyzer(params=vad_params),
+        )
+    )
+
+    # THE critical piece: VADProcessor consumes InputAudioRawFrame and emits
+    # VADUserStartedSpeakingFrame / VADUserStoppedSpeakingFrame, which the
+    # downstream SegmentedSTTService (Parakeet) subscribes to. Without this
+    # processor in the pipeline, no VAD events ever fire and Parakeet never
+    # runs a transcription.
+    vad_processor = VADProcessor(
+        vad_analyzer=SileroVADAnalyzer(params=vad_params),
+    )
+    logger.info("VADProcessor wired into pipeline")
+
+    stt = ParakeetMLXSTTService(
+        model_id=STT_MODEL_ID,
+        preloaded_model=preloaded_parakeet,
+        sample_rate=AUDIO_IN_SR,
+    )
+
+    # Critical for voice UX:
+    #   max_tokens caps reply length (model honors the system prompt's
+    #     "one or two sentences" but adds a safety net here)
+    #   extra.reasoning_effort=none disables Gemma 4's thinking mode
+    #     (verified 18x faster on one-sentence replies, see audit log)
+    llm_extra = {"reasoning_effort": LLM_REASONING_EFFORT}
+    logger.info(
+        "LLM: model=%s max_tokens=%d reasoning_effort=%s temperature=%.2f",
+        LLM_MODEL, LLM_MAX_TOKENS, LLM_REASONING_EFFORT, LLM_TEMPERATURE,
+    )
+    llm = OpenAILLMService(
+        api_key="ollama-local-unused",  # Ollama ignores the key on loopback.
+        base_url=LLM_BASE_URL,
+        settings=OpenAILLMService.Settings(
+            model=LLM_MODEL,
+            max_tokens=LLM_MAX_TOKENS,
+            temperature=LLM_TEMPERATURE,
+            extra=llm_extra,
+        ),
+    )
+
+    # Custom TTS service bypassing the openai SDK's voice-name enum
+    # validation (which rejects Kokoro voice ids like am_michael).
+    tts = KokoroTTSService(
+        base_url=TTS_BASE_URL,
+        model=TTS_MODEL,
+        voice=TTS_VOICE,
+        speed=TTS_SPEED_DEFAULT,
+        sample_rate=AUDIO_OUT_SR,
+    )
+
+    speech_rate = SpeechRateController(initial_speed=TTS_SPEED_DEFAULT)
+
+    context = LLMContext(
+        messages=[{"role": "system", "content": SYSTEM_PROMPT}],
+    )
+    aggregators = LLMContextAggregatorPair(context)
+
+    # Important: aggregators.user and aggregators.assistant are METHODS in
+    # Pipecat 1.0 (not attributes). Call them to obtain the actual frame
+    # processor instances.
+    processors = [transport.input()]
+    if AUDIO_PROBE_ENABLED:
+        processors.append(AudioFrameProbe())
+    if INPUT_GATE_ENABLED:
+        processors.append(InputAudioGate())  # drops mic while bot TTS plays
+    processors.extend([
+        vad_processor,            # emits VADUserStarted/StoppedSpeakingFrame
+        stt,                      # Parakeet segmented STT (consumes VAD events)
+        speech_rate,              # intercepts speed commands, bypasses LLM
+        aggregators.user(),       # records user turn into context
+        llm,                      # Gemma 4 via Ollama
+        tts,                      # Kokoro via mlx_audio.server
+        transport.output(),       # speaker
+        aggregators.assistant(),  # records assistant turn into context
+    ])
+    pipeline = Pipeline(processors)
+
+    task = PipelineTask(
+        pipeline,
+        params=PipelineParams(
+            enable_metrics=True,
+            audio_in_sample_rate=AUDIO_IN_SR,
+            audio_out_sample_rate=AUDIO_OUT_SR,
+        ),
+        conversation_id=SESSION_ID,
+    )
+
+    logger.info("Pipeline built. Speak into the mic whenever you're ready.")
+    logger.info("Ctrl+C to exit.")
+    events.event("pipecat_started")
+
+    runner = PipelineRunner()
+    try:
+        await runner.run(task)
+    finally:
+        events.event("pipecat_stopped")
+        try:
+            summary_path = write_session_summary(
+                session_id=SESSION_ID,
+                start_time=SESSION_START,
+                stats={"mode": "pipecat_local"},
+                extra={
+                    "config": {
+                        "stt_model": STT_MODEL_ID,
+                        "llm_model": LLM_MODEL,
+                        "tts_model": TTS_MODEL,
+                        "tts_voice": TTS_VOICE,
+                    },
+                },
+            )
+            logger.info("Session summary written: %s", summary_path)
+        except Exception as e:
+            logger.error("Failed to write session summary: %s", e, exc_info=True)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Shutting down Jarvis Pipecat (Ctrl+C)")
+        events.event("shutdown", reason="keyboard_interrupt")

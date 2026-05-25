@@ -1,0 +1,36 @@
+# Dependencies specific to the Pipecat full-duplex variant (jarvis_pipecat.py).
+#
+# Install with:
+#   source ~/venvs/local-ai/bin/activate
+#   uv pip install -r requirements-pipecat.txt
+#
+# These are installed on top of the core hardened venv (torch>=2.6, transformers>=4.53,
+# mlx>=0.29.4, pillow>=11.3 + mlx-audio + parakeet-mlx + ollama per the
+# local-ai-stack HARDENED_INSTALL_PLAN.md).
+#
+# Pins follow audit 05-Pipecat-Scenario-C-Audit.md where applicable. Version
+# ranges instead of exact pins because Pipecat's rev cadence is weekly and the
+# wider ecosystem is changing fast; re-audit with `uv pip list` periodically.
+
+# Pipecat orchestrator + the three extras we actually use.
+pipecat-ai[silero,openai,local,webrtc]>=1.0,<2.0
+
+# webrtcvad is a required dep of mlx_audio.server but its pyproject.toml
+# doesn't declare it. Without this the server dies at import time with
+# ModuleNotFoundError: No module named 'webrtcvad'.
+webrtcvad>=2.0.10
+
+# Speaker verification (jarvis_speaker.py + jarvis_enroll.py).
+# WeSpeaker ResNet34-LM ONNX runs via onnxruntime CoreML EP on M2 Max.
+# Per audit 12-Speaker-ID-Audit.md Section 8: torch>=2.7.1 closes
+# CVE-2025-32434, and we deliberately do NOT install the PyPI `wespeaker`
+# package (namespace-confusion risk; we use the official ONNX redistribution
+# at hbredin/wespeaker-voxceleb-resnet34-LM via huggingface_hub).
+onnxruntime>=1.20.0
+huggingface_hub>=0.36
+keyring>=25
+soundfile>=0.12
+# torchaudio supplies the kaldi-compatible Fbank extractor that the
+# hbredin/wespeaker-voxceleb-resnet34-LM ONNX expects (the model takes
+# (1, T, 80) log-Fbank, not raw waveform).
+torchaudio>=2.7.1
